@@ -38,3 +38,15 @@ Chain: aircraft camera -> remote -> phone (SDK v4 decodes video) -> [perception]
 3. S6 policy export: ONNX/LiteRT policy on the phone matches Python on 10k recorded observations; the safety layer unit-tested.
 4. S7 follow/avoid in sim: IBVS baseline then RL with detections; report vs baseline, same seeds.
 5. S2a/S2b real latency/gain into the sim; S3 staged real flight only with the pilot present, props off first, per-stage OK.
+## 7. Following at a chosen distance (added 2026-11-09, the owner: "stay 5 or 10 feet away")
+The Mini has ONE forward camera and no range sensor, so distance has to be inferred. Method on the phone (app 0.3.0, object `Range`):
+- range = real_height / (box_height_fraction * C), C = 2*tan(vertical FOV / 2). Typical real heights: person 1.7 m, bicycle 1.0 m, car 1.5 m (editable). The default C (0.815) assumes full-width 16:9 video; the app has a "Calibrate range" button: select the target at a measured distance, enter feet, C is rescaled and saved.
+- Smoothing: EMA per track; boxes cut by the frame edge are ignored; no forward motion without a usable range; never advance inside 1.5 m of the target.
+- Honest accuracy: roughly +-20-30% (people vary, bicycle boxes may or may not include the rider, pitch of the aircraft/gimbal changes apparent height). Good enough for "about 15 ft", not for "exactly 15 ft". A second estimate can later come from the depth model, anchored to the box-height range (relative depth gets a scale from a known anchor).
+- Controller (baseline, in the app): yaw from the horizontal image error, forward speed = 0.35 m/s per metre of range error, deadband 0.4 m, +-1 m/s caps via the safety layer.
+
+### What this means for training (cards S7, S5, Q3)
+1. The learned follower must be GOAL-CONDITIONED on distance: observation = [target bearing (box centre x), target range ESTIMATE, desired range, target visible flag, time since seen, plus the usual 15 state numbers], action = forward/right/down velocity + yaw rate. Desired range is sampled per episode (1.5 - 15 m) so one policy serves any distance the owner dials in.
+2. The sim must give the policy the SAME measurement the phone gives, NOT ground truth: render the target at real size (person 1.7 m, bicycle, car), project it through the camera model to a box, compute range with the same formula, add noise (+-20%), box-edge dropouts and the real detector's latency/misses. A policy trained on perfect distance will fail on the real estimate.
+3. Reward: -|true_range - desired| (shaped), keep the target centred, penalise jerk, big penalty inside 1.5 m, no reward for fast motion. Evaluate against the app's baseline controller on the same scripted target paths (walking, stop/start, turning).
+4. Calibrate C on the real camera (S5) BEFORE trusting any real range number; log estimate vs tape-measured distance at 3, 5, 10, 15 m to put the real error bars into the sim noise.
