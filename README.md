@@ -14,6 +14,8 @@ Flight commands (virtual stick) on the real aircraft, live video decoding, on-ph
 - `docs/REAL_AIRCRAFT_LINK.md`: how the link works, message format, gimbal command, safety rules, the plan for flying.
 - `docs/VISION_ONBOARD_RESEARCH.md`: where perception and the pilot run (phone vs laptop), models, licenses, test ladder.
 - `docs/VISION_AVOIDANCE_RESEARCH.md`: camera-based obstacle avoidance research.
+- `sim/`: the AirSim gym environment, SAC training script, and the waypoint (stage 2) environment with its reward check. Paths are from the original Windows setup (`D:\fpv\...`); adjust them.
+- `ccw/`: a reduced-scale implementation of concept-based explanations (CCW-Net, arXiv 2603.21369) applied to the hover policy. Experimental and not yet validated against the paper.
 - `tools/mavic_link.py`: read gimbal pitch, move the gimbal one safe step.
 
 ## Safety
