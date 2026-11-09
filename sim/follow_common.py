@@ -24,11 +24,22 @@ Spec sections implemented here:
       conf = clip(N(0.85,0.08), 0, 1); on miss the box is frozen and age++;
       latency: the box shown at step t is the GT box of step t-L, L ~ U{0,1}
       or set from FPV_LAT_MS hi/lo by the caller.
-  D7  reward v5 (survival-shaped, NO positive terminal, terminals bad-only):
-      r_step = 0.5*in_view + 0.4*center + 0.2*range_t
+  D7  reward v5 -> v6 (survival-shaped, NO positive terminal, terminals
+      bad-only). v6 (D11): the range term is GOAL-CONDITIONED on a
+      per-episode desired range and a close-guard subtracts CLOSE_PENALTY
+      while the true range is inside CLOSE_GUARD:
+      r_step = 0.5*in_view + 0.4*center + 0.2*max(0,1-|log(dist/desired)|)
                - 0.05*||a|| - 0.03*||a - a_prev|| - 0.02*||v||
-      terminals: landed -10, >12 m from origin -10, collision -20.
+               - CLOSE_PENALTY if dist < CLOSE_GUARD (per-step, NOT terminal)
+      terminals: landed -10, flew-out -10, collision -20 (flew-out radius
+      scales with desired per D11 in the env).
       Dominance is PROVEN offline by check_follow_reward.py (card hard rule).
+  D11 goal-conditioned desired range U[FPV_RANGE_MIN, FPV_RANGE_MAX]
+      (default 1.5..15 m), sampled per episode by the env from its rng;
+      FPV_DIST_STAR set => FIXED desired for every episode (back-compat eval).
+  D12 apparent-size range estimate identical to the phone app's `Range`
+      object (VISION_ONBOARD_RESEARCH.md section 7): range_estimate() pure
+      formula + RangeEstimator (EMA + +-noise + frame-edge-dropout aware).
 
 Coordinates everywhere are AirSim NED (x north, y east, z DOWN).
 """
@@ -84,7 +95,7 @@ def cam_axes(drone_yaw, p):
 def project_target(drone_pos, drone_yaw, target_pos, target_h, params=None):
     """GT detector box per D4: project the vertical segment
     base=target_pos -> top=target_pos+[0,0,-target_h] (NED up is -z) through
-    the pinhole. Returns dict(cx, cy, h_px, dist, in_fov).
+    the pinhole. Returns dict(cx, cy, h_px, dist, in_fov, edge_cut).
 
     cx/cy are the segment-midpoint pixel of the two projected endpoints,
     clipped to the frame (D4 "cy ... clip to frame"); h_px is the projected
@@ -93,6 +104,10 @@ def project_target(drone_pos, drone_yaw, target_pos, target_h, params=None):
     the 3D distance drone -> target base (D7 range uses this). When the target
     is not in front of the camera plane: in_fov=False, h_px=0, cx/cy at the
     principal point (harmless -- the detector treats in_fov=False as a miss).
+    edge_cut (D12): True when either RAW (unclipped) endpoint pixel lies
+    outside [0,W)x[0,H) -- the visible segment is cut by the frame edge, so
+    h_px under-reports and the phone app would drop the box from the range
+    estimator. in_fov logic is UNCHANGED by this flag.
     """
     p = params or default_cam()
     f, r, d = cam_axes(drone_yaw, p)
@@ -104,7 +119,7 @@ def project_target(drone_pos, drone_yaw, target_pos, target_h, params=None):
     zb, zt = float(rb @ f), float(rt @ f)
     if zb <= 1e-6 or zt <= 1e-6:            # endpoint behind camera plane
         return {"cx": p["cx0"], "cy": p["cy0"], "h_px": 0.0,
-                "dist": dist, "in_fov": False}
+                "dist": dist, "in_fov": False, "edge_cut": True}
     ub = p["cx0"] + p["fx"] * float(rb @ r) / zb
     vb = p["cy0"] + p["fy"] * float(rb @ d) / zb
     ut = p["cx0"] + p["fx"] * float(rt @ r) / zt
@@ -112,9 +127,12 @@ def project_target(drone_pos, drone_yaw, target_pos, target_h, params=None):
     cx_raw, cy_raw = 0.5 * (ub + ut), 0.5 * (vb + vt)
     h_px = float(np.clip(abs(vb - vt), 0.0, p["H"]))
     in_fov = bool(0.0 <= cx_raw < p["W"] and 0.0 <= cy_raw < p["H"])
+    edge_cut = bool(not (0.0 <= ub < p["W"] and 0.0 <= vb < p["H"]
+                         and 0.0 <= ut < p["W"] and 0.0 <= vt < p["H"]))
     return {"cx": float(np.clip(cx_raw, 0.0, p["W"] - 1.0)),
             "cy": float(np.clip(cy_raw, 0.0, p["H"] - 1.0)),
-            "h_px": h_px, "dist": dist, "in_fov": in_fov}
+            "h_px": h_px, "dist": dist, "in_fov": in_fov,
+            "edge_cut": edge_cut}
 
 
 def h_star_for(target_h, dist_star=6.0, params=None):
@@ -147,7 +165,8 @@ def target_speed_scale():
 
 def sample_target(rng, kind="rand", drone_start=(0.0, 0.0, 0.0),
                   drone_yaw=0.0, ground_z=-2.7, r_min=6.0, r_max=12.0,
-                  duration=240.0, dt=0.05, params=None, speed_scale=None):
+                  duration=240.0, dt=0.05, params=None, speed_scale=None,
+                  desired=None):
     """Sample one per-episode target script (D2). rng must expose
     random.Random-style random()/uniform()/randint()/. choice is done here.
     The trajectory is pre-integrated at dt so target_at(script, t) is a pure
@@ -157,6 +176,12 @@ def sample_target(rng, kind="rand", drone_start=(0.0, 0.0, 0.0),
     Spawn: ground level, horizontal range U[r_min, r_max] = U[6,12] m, bearing
     within +-25 deg of the drone's start yaw so the target starts inside the
     camera FOV (horizontal half-FOV = atan(cx0/fx) ~= 29.4 deg).
+
+    desired (D11): when an episode desired range is given, the spawn band
+    scales with it: U[max(2.0, 0.6*desired), max(3.0, 1.4*desired)] so a 15 m
+    follow target does not start at a silly 6 m and a 1.5 m target does not
+    start at 12 m. desired=None keeps the legacy U[r_min, r_max] band so
+    existing checker code paths are untouched.
 
     Target speed = KINDS[kind]["speed"] * scale, where scale is the explicit
     speed_scale argument when not None, else FPV_TARGET_SPEED_SCALE (default
@@ -174,6 +199,9 @@ def sample_target(rng, kind="rand", drone_start=(0.0, 0.0, 0.0),
     spec = KINDS[kind]
     fov_half = math.degrees(math.atan(p["cx0"] / p["fx"]))
     margin = math.radians(max(0.0, fov_half - 4.0))        # inside FOV (D2)
+    if desired is not None:                   # D11 spawn band scales with goal
+        r_min = max(2.0, 0.6 * float(desired))
+        r_max = max(3.0, 1.4 * float(desired))
     rng0 = rng.uniform(r_min, r_max)
     bearing = drone_yaw + rng.uniform(-margin, margin)
     ds = np.asarray(drone_start, dtype=np.float64)
@@ -287,6 +315,71 @@ def dr_detector_params(rng):
 
 
 # ---------------------------------------------------------------------------
+# apparent-size range estimate (D12) -- the SAME measurement the phone app
+# computes (VISION_ONBOARD_RESEARCH.md section 7, app 0.3.0 `Range` object)
+# ---------------------------------------------------------------------------
+
+def range_estimate(h_px, real_height, params=None):
+    """Phone-identical apparent-size range (D12).
+
+    C = H/fy equals 2*tan(vertical FOV / 2) for this pinhole model
+    (vFOV = 2*atan(H/(2*fy))). frac = h_px/H is the box-height fraction of
+    frame height, so range = real_height / (frac * C) inverts the projection
+    h_px = fy*real_height/z exactly when z is the depth along the optical
+    axis (that slant-range semantics is also what the phone produces --
+    distance along the camera axis, not ground range). frac <= 0 -> inf
+    (nothing measurable). Exactly the app formula; no sim-only extras.
+    """
+    p = params or default_cam()
+    C = p["H"] / p["fy"]
+    frac = float(h_px) / p["H"]
+    if frac <= 0.0:
+        return float("inf")
+    return float(real_height) / (frac * C)
+
+
+class RangeEstimator:
+    """Smoothed, noisy apparent-size range estimate (D12) mirroring the phone
+    app: EMA per track, +-noise (multiplicative), frame-edge-cut boxes and
+    missing boxes are IGNORED (no update -- stale estimate persists but is
+    flagged invalid), first valid hit seeds the EMA. rng: random.Random-style,
+    shared with the episode rng so same-seed streams stay identical.
+
+    update(box, edge_cut) -> (est, valid): box None or edge_cut True =>
+    (self.est, False) WITHOUT updating. Freshness (box age) is the CALLER's
+    business (D13): pass None for stale/frozen boxes if you want the app's
+    "usable hit this step" semantics. est starts +inf (no measurement yet);
+    a non-finite raw estimate is reported invalid and never poisons the EMA.
+    Knobs FPV_RANGE_NOISE (0.2) / FPV_RANGE_EMA (0.3) are read at CALL time
+    via _env_f when the explicit args are None (launcher overrides honored in
+    spawned sub-env processes).
+    """
+
+    def __init__(self, rng, real_height, params=None, noise=None,
+                 ema_alpha=None):
+        self.rng = rng
+        self.h = float(real_height)
+        self.params = params or default_cam()
+        self.noise = _env_f("FPV_RANGE_NOISE", 0.2) if noise is None \
+            else float(noise)
+        self.alpha = _env_f("FPV_RANGE_EMA", 0.3) if ema_alpha is None \
+            else float(ema_alpha)
+        self.est = float("inf")
+
+    def update(self, box, edge_cut=False):
+        """One step. Returns (est, valid) -- see class docstring."""
+        if box is None or edge_cut:
+            return self.est, False
+        raw = range_estimate(box["h_px"], self.h, self.params) \
+            * self.rng.uniform(1.0 - self.noise, 1.0 + self.noise)
+        if not math.isfinite(raw):
+            return self.est, False
+        self.est = raw if not math.isfinite(self.est) \
+            else self.alpha * raw + (1.0 - self.alpha) * self.est
+        return self.est, True
+
+
+# ---------------------------------------------------------------------------
 # depth grid (D5)
 # ---------------------------------------------------------------------------
 
@@ -343,21 +436,23 @@ def depth_grid(drone_pos, drone_yaw, objects, params=None,
 
 
 # ---------------------------------------------------------------------------
-# reward v5 (D7) -- PURE, dominance-proven by check_follow_reward.py
+# reward v6 (D7 + D11) -- PURE, dominance-proven by check_follow_reward.py
 # ---------------------------------------------------------------------------
 
 R_STEP_CEILING = 1.1          # 0.5 + 0.4 + 0.2, penalties only subtract
 TERM_LANDED = -10.0           # drone landed mid-episode (D7)
-TERM_FLEW_OUT = -10.0         # drone > 12 m from start (D7)
+TERM_FLEW_OUT = -10.0         # > leave-radius from start (D7, radius per D11)
 TERM_COLLISION = -20.0        # collision with anything (D7)
-DIST_STAR = 6.0               # desired follow range (D7)
+DIST_STAR = 6.0               # fallback desired range only (D11: goal per-ep)
+CLOSE_GUARD = 1.5             # metres (v6): never-this-close "danger zone"
+CLOSE_PENALTY = 2.0           # per-step subtraction inside CLOSE_GUARD (v6)
 K_VIEW = 20                   # steps until a lost box "ages out" (D7)
 
 
 def follow_reward(cx_err, cy_err, dist, in_view, a_norm, da_norm, v_norm,
                   landed=False, flew_out=False, collided=False,
-                  dist_star=DIST_STAR):
-    """S7 follow reward v5 (D7) -- PURE function, no sim imports.
+                  desired=DIST_STAR):
+    """S7 follow reward v6 (D7 + D11) -- PURE function, no sim imports.
 
     Survival-shaped, NO positive terminal anywhere; terminals are bad-only
     and their magnitudes exceed anything that early termination can harvest
@@ -365,14 +460,32 @@ def follow_reward(cx_err, cy_err, dist, in_view, a_norm, da_norm, v_norm,
     Q3 hover stages). check order: collided -> landed/flew_out -> per-step.
 
         r = 0.5*in_view + 0.4*max(0,1-|cx_err,cy_err|)
-            + 0.2*max(0,1-|log(dist/dist_star)|)
+            + 0.2*max(0,1-|log(dist/desired)|)
             - 0.05*||a|| - 0.03*||a-a_prev|| - 0.02*||v||
+            - CLOSE_PENALTY if dist < CLOSE_GUARD   (per-step, NOT terminal)
+
+    GOAL-CONDITIONED (D11): `desired` is the per-episode follow range the
+    policy is conditioned on (obs block carries it, D13). the owner's literal ask
+    is -|true_range - desired|; we keep the LOG form |log(dist/desired)|
+    because it is scale-free -- an absolute-metre term would make a 1.5 m
+    follow episode ~10x harder to earn range reward than a 15 m one, so the
+    gradient would skew toward the far end of the desired sweep. The log form
+    gives 1.5 m and 15 m episodes EQUAL weighting (same relative error =
+    same term), which is the whole point of goal-conditioning.
+
+    Close-guard (v6): inside CLOSE_GUARD metres the step loses CLOSE_PENALTY
+    every step -- NOT a terminal (terminals stay bad-only landed/flew-out -10,
+    collision -20). The checker proves 2.0 > the max 0.2 range-term gain, so
+    parking on top of the target can never pay even with range_term = 0.2.
     """
     if collided:
         return TERM_COLLISION
     if landed or flew_out:
         return TERM_LANDED
     center = max(0.0, 1.0 - math.hypot(cx_err, cy_err))
-    range_t = max(0.0, 1.0 - abs(math.log(max(dist, 0.05) / dist_star)))
-    return (0.5 * (1.0 if in_view else 0.0) + 0.4 * center + 0.2 * range_t
-            - 0.05 * a_norm - 0.03 * da_norm - 0.02 * v_norm)
+    range_t = max(0.0, 1.0 - abs(math.log(max(dist, 0.05) / desired)))
+    r = (0.5 * (1.0 if in_view else 0.0) + 0.4 * center + 0.2 * range_t
+         - 0.05 * a_norm - 0.03 * da_norm - 0.02 * v_norm)
+    if dist < CLOSE_GUARD:
+        r -= CLOSE_PENALTY
+    return r

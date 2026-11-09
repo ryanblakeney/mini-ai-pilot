@@ -90,15 +90,22 @@ try:
     ibvs = IBVSFollow()
 
     def ibvs_act(obs):
-        # box features from the SAME obs the policy sees (D5 layout):
-        # [15]cx_err [16]cy_err [17]log(h/h*) [18]conf [19]age/10, yaw=obs[8]
-        cx_err, cy_err, log_h, conf, age10 = obs[15:20]
+        # box features from the SAME obs the policy sees (D13 obs v2 layout):
+        # [15]cx_err [16]cy_err [17]clip(log(est/desired)) [18]desired/15
+        # [19]range_valid [20]conf [21]age/10, yaw=obs[8]. Reconstruct the
+        # range estimate from the obs itself => strictly same-seed,
+        # obs-faithful comparison with the learned policy (D14).
+        feats = obs[15:22]
+        cx_err, cy_err, log_r = float(feats[0]), float(feats[1]), float(feats[2])
+        desired = float(feats[3]) * 15.0
+        valid = bool(feats[4] > 0.5)
+        conf, age10 = float(feats[5]), float(feats[6])
         box = None if conf <= 0.0 else {
             "cx": env._cam["cx0"] + cx_err * env._cam["cx0"],
             "cy": env._cam["cy0"] + cy_err * env._cam["cy0"],
-            "h_px": env._h_star * float(np.exp(log_h)),
             "age": age10 * 10.0}
-        a = ibvs.action(box, env._h_star, drone_yaw=float(obs[8]))
+        est = desired * float(np.exp(log_r))
+        a = ibvs.action(box, est, valid, desired, drone_yaw=float(obs[8]))
         return a[:n_act]
 
     rows = []

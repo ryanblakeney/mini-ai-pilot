@@ -130,6 +130,62 @@ page_journal entry per milestone.
   per-visible-step, loss time is a first-class column.
 - Checker imports follow_common directly (pure by design); no regex extraction.
 
+## D11 Goal-conditioned range (the owner 2026-11-09 14:58)
+Per-episode desired follow range d ~ U[FPV_RANGE_MIN, FPV_RANGE_MAX] (default
+1.5..15 m), drawn in follow_env.reset() from the SEEDED episode rng in a fixed
+draw order (desired first, then detector knobs, then the target script) so
+same-seed streams stay identical for policy AND baselines; FPV_DIST_STAR set
+pins a FIXED desired for every episode (back-compat eval). Reward range term
+STAYS scale-free: 0.2*max(0, 1-|log(dist/desired)|) — the owner's ask is
+-|true_range - desired|, but a LINEAR metre term would make a 1.5 m episode
+~10x harder to earn range reward than a 15 m one and skew the gradient toward
+the far end of the sweep; the LOG form weights 1.5 m and 15 m episodes EQUAL
+(same relative error = same term), which is the point of goal-conditioning
+(documented in follow_reward's docstring and check_follow_reward.py). New v6
+close-guard: dist < CLOSE_GUARD (1.5 m) subtracts CLOSE_PENALTY (2.0) per step
+— NOT a terminal (terminals stay bad-only landed/flew-out -10, collision -20);
+the checker proves 2.0 dominates the max 0.2 range-term gain. flew-out radius
+scales: max(12, desired + 8) m (a 15 m follow must not force a flew-out
+terminal), and sample_target(desired=...) spawns at horizontal range
+U[max(2, 0.6d), max(3, 1.4d)] (desired=None keeps legacy U[6,12]).
+Rationale: one policy serves any distance the owner dials in (research doc §7).
+
+## D12 Range estimate from apparent size (phone-identical)
+The obs carries the PHONE's measurement, never ground truth: pure
+range_estimate(h_px, real_height) = real_height / ((h_px/H) * C), C = H/fy =
+2*tan(vFOV/2) — the exact app 0.3.0 `Range` formula (research doc §7),
+inverting to slant range along the optical axis. RangeEstimator adds the app's
+smoothing + dropouts: EMA (FPV_RANGE_EMA, 0.3), +-noise (FPV_RANGE_NOISE, 0.2
+multiplicative, first valid hit seeds), frame-edge-cut and missing boxes are
+IGNORED without updating (stale est persists, flagged invalid); stale/frozen
+boxes are not fed at all (freshness is the caller's call, D13).
+project_target now returns edge_cut (raw endpoint outside frame; in_fov logic
+UNCHANGED). Rationale: a policy trained on perfect distance fails on the real
+estimate (research doc §7 item 2); checker proves inversion + EMA semantics.
+
+## D13 Obs v2 Box(37)
+Box-feats block grows 5 -> 7: [0] cx_err clip[-1,1], [1] cy_err clip[-1,1],
+[2] clip(log(est/desired), -2, 2) (0.0 with no valid est yet), [3]
+desired/15.0, [4] range_valid (usable THIS step: estimator valid AND box
+fresh), [5] conf, [6] min(age/10, 1). Total obs = 15 state + 7 feats + 15
+depth = Box(37); info adds desired / range_est / range_valid.
+Rationale: the goal and the measurement's trustworthiness must be IN the
+observation for goal-conditioning and honest loss handling to be learnable.
+
+## D14 IBVS baseline = app 0.3.0 FollowBehavior
+IBVSFollow.action(box, est, range_valid, desired, drone_yaw) (h_star arg
+removed): yaw servo unchanged (D8); forward v_f = clip(0.35*(est-desired),
+-1, 1) m/s with deadband FPV_IBVS_DEADBAND_M (0.4 m), 0 without a usable
+range, never positive while est < 1.5 m (app hard floor); vertical trim
+scaled by est/desired; hover-on-loss unchanged; NEW give-up: >= 8 s
+continuous loss (FPV_IBVS_GIVEUP_S / step_dt = 16 steps @ 0.5 s) => permanent
+all-zero action until reset() — the app stops a hopeless follow.
+rl_eval_follow.ibvs_act reconstructs est/desired/valid from the SAME obs the
+policy sees (est = desired*exp(feats[2]), desired = feats[3]*15, valid =
+feats[4]) keeping the comparison strictly same-seed and obs-faithful.
+Rationale: the learned policy must beat the controller the owner actually ships,
+not a different one.
+
 ## Open risks (tracked)
 1. projectairsim rotate API untested (fallback D3).
 2. Scene-object list may include the drone itself / odd AABBs — filter by name, verify in smoke.

@@ -6,25 +6,33 @@ LandedState decode LANDED=0, takeoff+settle reset, disconnect-before-exit.
 Subclass only -- the parent plumbing is load-bearing and must never be
 rewritten (waypoint_env.py / obstacle_env.py precedent).
 
-Task (docs/S7_FOLLOW_DESIGN.md, decisions D1-D10 LOCKED -- no redesign):
+Task (docs/S7_FOLLOW_DESIGN.md, decisions D1-D14 LOCKED -- no redesign):
 a virtual scripted target (person/bicycle/car, D2) moves on the ground;
-the agent sees a synthetic detector box (D4 pinhole projection + D6 noise)
-plus a 3x5 depth grid (D5) and must keep it centered at range dist_star.
+the agent sees a synthetic detector box (D4 pinhole projection + D6 noise),
+the phone-app apparent-size RANGE ESTIMATE of that box (D12, same formula +
+EMA + +-noise + edge dropouts -- never ground truth), a per-episode DESIRED
+follow range (D11, goal-conditioned), plus a 3x5 depth grid (D5), and must
+keep the target centered at the desired range.
 
   action  = [v_n, v_e, v_d, yaw_rate] Box(4) +-1 (D3; yaw dim = +-0.5 rad/s
             via the client rotate API -- UNTESTED on this rig per D3, smoke
             verifies; FPV_YAW=0 falls back to Box(3) translation-only and
             LOGS once). step[3] applies for the step after issuing (rate
             held across the next step window).
-  obs     = Box(35) per D5: [15] raw hover state (err3 vel3 rpy3 ang3
-            prev-action-trans3) + [5] box feats cx_err, cy_err (clipped
-            [-1,1]), log(h_px/h_star), conf, age/10 (clipped) + [15] depth
-            grid row-major ((d-1)/19, free=1.0).
-  reward  = reward v5, PURE follow_reward() in follow_common.py (D7);
-            dominance PROVEN offline by check_follow_reward.py before any
-            launch (card hard rule -- the Q3 hover killers).
-  term    = collision -20 | landed -10 | >12 m from START -10 (bad-only,
-            no positive terminal); trunc = max_steps (100).
+  obs     = Box(37) per D13: [15] raw hover state (err3 vel3 rpy3 ang3
+            prev-action-trans3) + [7] box feats: cx_err, cy_err (clipped
+            [-1,1]), clip(log(range_est/desired), -2, 2) (0.0 with no valid
+            est yet), desired/15.0, range_valid 0/1 (usable THIS step),
+            conf, age/10 (clipped) + [15] depth grid row-major
+            ((d-1)/19, free=1.0).
+  reward  = reward v6, PURE follow_reward() in follow_common.py (D7 + D11:
+            goal-conditioned range term, close-guard -2.0/step inside 1.5 m,
+            NO positive terminal); dominance PROVEN offline by
+            check_follow_reward.py before any launch (card hard rule -- the
+            Q3 hover killers).
+  term    = collision -20 | landed -10 | > max(12, desired+8) m from START
+            -10 (bad-only, radius scales with the D11 goal); trunc =
+            max_steps (100).
 
 Collision route: IDENTICAL pattern to obstacle_env.py -- PRIMARY the real
 collision_info pub/sub topic (client.subscribe on its own recv thread);
@@ -33,11 +41,14 @@ get_object_pose AABBs, trailing '_<cm>' name suffix = full edge). The SAME
 enumerated AABBs feed the D5 depth grid, with the drone itself excluded by
 name (cube-name regex already excludes "Drone1"; floor/ground excluded too).
 
-Env knobs (D2/D3/D6): FPV_TARGET_KIND person|bike|bicycle|car|rand,
+Env knobs (D2/D3/D6/D11/D12): FPV_TARGET_KIND person|bike|bicycle|car|rand,
 FPV_PMISS, FPV_JIT (frame fraction), FPV_LAT_MS ("400" or "300-500"),
 FPV_YAW (0 -> 3-D action, logged fallback), FPV_DR (1 = per-episode
 domain randomization), FPV_GROUND_Z (default -2.7, Blocks scene ground),
-FPV_COLL_ROUTE (auto|geometry), plus the parent's FPV_DISTURB_* / FPV_PORT_*.
+FPV_COLL_ROUTE (auto|geometry), FPV_RANGE_MIN / FPV_RANGE_MAX (D11 desired
+sweep bounds, default 1.5 / 15.0 m), FPV_DIST_STAR set => FIXED desired
+every episode (back-compat), FPV_RANGE_NOISE / FPV_RANGE_EMA (D12), plus the
+parent's FPV_DISTURB_* / FPV_PORT_*.
 
 Coordinates: AirSim NED. Run ONLY where Blocks.exe is listening
 (scheduled-task console-session pattern). py_compile-only on non-Windows.
@@ -54,7 +65,8 @@ import follow_common as fc
 from gym_env import BlocksDroneEnv, quat_to_rpy
 
 SETTLED_GUARD = 10          # mirror parent landed guard: takeoff/settle bump
-LEAVE_RADIUS = 12.0         # D7: >12 m from START => -10 terminal
+LEAVE_RADIUS = 12.0         # D7 leave radius FLOOR; D11: per-episode it is
+#                             max(LEAVE_RADIUS, desired + 8.0)
 CUBE_NAME_RE = re.compile(r"block|cube", re.IGNORECASE)
 EXCLUDE_NAME_RE = re.compile(r"floor|ground|plane|pad|light|sky|fog|volume",
                              re.IGNORECASE)
@@ -81,21 +93,29 @@ class FollowDroneEnv(BlocksDroneEnv):
             self._lat_lo = float(parts[0])
             self._lat_hi = float(parts[-1])
         self._ground_z = float(os.environ.get("FPV_GROUND_Z", "-2.7"))
-        self._dist_star = float(os.environ.get("FPV_DIST_STAR", fc.DIST_STAR))
+        # D11: FPV_DIST_STAR set => FIXED desired every episode (back-compat
+        # eval); otherwise desired ~ U[FPV_RANGE_MIN, FPV_RANGE_MAX] sampled
+        # per-episode in reset() from the SEEDED rng (same seed => same
+        # stream for policy AND baselines, rl_eval_follow contract).
+        ds = os.environ.get("FPV_DIST_STAR", "").strip()
+        self._fixed_desired = float(ds) if ds else None
+        self._desired = fc.DIST_STAR          # overwritten every reset()
+        self._leave_radius = LEAVE_RADIUS     # recomputed per episode (D11)
         self._cam = fc.default_cam()
-        # ---- action/obs spaces (D3/D5) ----
+        # ---- action/obs spaces (D3/D13) ----
         n_a = 4 if self._yaw_on else 3
         self.action_space = spaces.Box(-1.0, 1.0, (n_a,), dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, (35,),
+        self.observation_space = spaces.Box(-np.inf, np.inf, (37,),
                                            dtype=np.float32)
         # ---- episode state ----
         self._script = None
         self._noise = None
-        self._h_star = fc.h_star_for(1.7, self._dist_star, self._cam)
+        self._range = None                    # fc.RangeEstimator (D12)
+        self._h_star = fc.h_star_for(1.7, self._desired, self._cam)
         self._start = None
         self._prev_a4 = np.zeros(4, dtype=np.float32)
         self._loss_steps = 0
-        self._box_feats = np.zeros(5, dtype=np.float32)
+        self._box_feats = np.zeros(7, dtype=np.float32)
         self._grid_objs = []
         # ---- collision route (IDENTICAL to obstacle_env.py) ----
         self._collide_evt = threading.Event()
@@ -196,8 +216,19 @@ class FollowDroneEnv(BlocksDroneEnv):
         self._start = pos0.copy()
         self._prev_a4 = np.zeros(4, dtype=np.float32)
         self._loss_steps = 0
-        self._box_feats = np.zeros(5, dtype=np.float32)
+        self._box_feats = np.zeros(7, dtype=np.float32)
         self._collide_evt.clear()
+        # D11: draw the episode desired AFTER seeding (fixed draw order:
+        # desired FIRST, then detector knobs, then the script) so same-seed
+        # streams stay identical across conditions; FPV_DIST_STAR override
+        # pins it (back-compat eval).
+        if self._fixed_desired is not None:
+            self._desired = float(self._fixed_desired)
+        else:
+            lo = fc._env_f("FPV_RANGE_MIN", 1.5)
+            hi = fc._env_f("FPV_RANGE_MAX", 15.0)
+            self._desired = float(self._rng.uniform(lo, hi))
+        self._leave_radius = max(LEAVE_RADIUS, self._desired + 8.0)
         # detector knobs: FIXED draw order after seed => identical box
         # streams for policy/baselines on the same seed (rl_eval_follow).
         lat = fc.sample_latency_steps(self._rng, self.step_dt,
@@ -211,9 +242,14 @@ class FollowDroneEnv(BlocksDroneEnv):
         self._script = fc.sample_target(self._rng, self._kind,
                                         drone_start=pos0, drone_yaw=yaw0,
                                         ground_z=self._ground_z,
+                                        params=self._cam,
+                                        desired=self._desired)
+        # D12: the phone-identical range estimator (draws from the SAME rng
+        # after seeding -- same-seed streams stay identical).
+        self._range = fc.RangeEstimator(self._rng, self._script["height"],
                                         params=self._cam)
         self._h_star = fc.h_star_for(self._script["height"],
-                                     self._dist_star, self._cam)
+                                     self._desired, self._cam)
         if self.collision_route == "geometry":
             self._boxes = self._lp.sync(self._enumerate_boxes(), timeout=120)
             if not self._boxes_logged:
@@ -228,11 +264,13 @@ class FollowDroneEnv(BlocksDroneEnv):
             src = self._lp.sync(self._enumerate_boxes(), timeout=120)
         self._grid_objs = [(n, c, np.array([h, h, h], dtype=np.float32))
                            for (n, c, h) in src]
-        obs = self._obs35(self._obs_from_kin(k0)[0], k0)
+        obs = self._obs37(self._obs_from_kin(k0)[0], k0)
         return obs, {"dist": 0.0, "in_view": False, "center_err": 0.0,
-                     "loss_steps": 0, "target_kind": self._script["kind"]}
+                     "loss_steps": 0, "target_kind": self._script["kind"],
+                     "desired": self._desired,
+                     "range_est": float("nan"), "range_valid": False}
 
-    def _obs35(self, state15, k):
+    def _obs37(self, state15, k):
         feats = self._box_feats
         grid = fc.depth_grid(np.asarray(state15[:3], dtype=np.float64)
                              + np.asarray(self._target, dtype=np.float64),
@@ -270,16 +308,31 @@ class FollowDroneEnv(BlocksDroneEnv):
         in_view = box is not None and self._noise.age <= fc.K_VIEW
         if not in_view:
             self._loss_steps += 1
+        # D12/D13: feed the phone-identical range estimator the FRESH noisy
+        # box (frozen/stale boxes are unusable, like the app) with the GT
+        # edge_cut flag; range_valid = usable measurement THIS step.
+        fresh = box is not None and box["age"] == 0
+        est, est_valid = self._range.update(box if fresh else None,
+                                            bool(gt.get("edge_cut", False)))
+        range_valid = bool(est_valid) and fresh
         if box is not None:
             cx_err = float(np.clip((box["cx"] - self._cam["cx0"])
                                    / self._cam["cx0"], -1.0, 1.0))
             cy_err = float(np.clip((box["cy"] - self._cam["cy0"])
                                    / self._cam["cy0"], -1.0, 1.0))
-            log_h = float(np.log(max(box["h_px"], 1.0) / self._h_star))
-            self._box_feats = np.array([cx_err, cy_err, log_h, box["conf"],
-                                        min(box["age"] / 10.0, 1.0)],
-                                       dtype=np.float32)
-        obs = self._obs35(state15, k)
+            conf = float(box["conf"])
+            age10 = min(float(box["age"]) / 10.0, 1.0)
+        else:
+            cx_err = cy_err = 0.0
+            conf = 0.0
+            age10 = min(float(self._noise.age) / 10.0, 1.0)
+        # obs v2 (D13) box-feats block, 7-D
+        log_r = (float(np.clip(np.log(est / self._desired), -2.0, 2.0))
+                 if (range_valid and np.isfinite(est)) else 0.0)
+        self._box_feats = np.array(
+            [cx_err, cy_err, log_r, self._desired / 15.0,
+             1.0 if range_valid else 0.0, conf, age10], dtype=np.float32)
+        obs = self._obs37(state15, k)
         # terminals (D7, bad-only)
         dist_start = float(np.linalg.norm(pos - self._start))
         if self._n <= SETTLED_GUARD:
@@ -289,14 +342,15 @@ class FollowDroneEnv(BlocksDroneEnv):
             collided = bool(self._collide_evt.is_set())
         else:
             collided = self._geom_hit(pos)
-        flew_out = bool(dist_start > LEAVE_RADIUS)
+        flew_out = bool(dist_start > self._leave_radius)   # D11 scaled radius
         reward = fc.follow_reward(
             float(self._box_feats[0]), float(self._box_feats[1]),
             gt["dist"], in_view,
             float(np.linalg.norm(action)),
             float(np.linalg.norm(action - self._prev_a4)),
             float(np.linalg.norm(state15[3:6])),
-            landed=landed, flew_out=flew_out, collided=collided)
+            landed=landed, flew_out=flew_out, collided=collided,
+            desired=self._desired)
         self._prev_a4 = action
         terminated = bool(collided or landed or flew_out)
         truncated = bool(self._n >= self.max_steps)
@@ -308,4 +362,7 @@ class FollowDroneEnv(BlocksDroneEnv):
             "dist_start": dist_start,
             "target_kind": self._script["kind"],
             "age": self._noise.age,
-            "h_star": self._h_star}
+            "h_star": self._h_star,
+            "desired": self._desired,
+            "range_est": float(est) if np.isfinite(est) else float("nan"),
+            "range_valid": range_valid}
