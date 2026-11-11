@@ -18,8 +18,11 @@ method automatically, so _make_env must be a module-level picklable callable
 Env contract (set by task_train_v4.ps1):
   FPV_MULTI  number of parallel sim instances (default 6)
   FPV_STEPS  GLOBAL env steps across all envs (default 48000)
-  FPV_CKPT   checkpoint interval in GLOBAL steps (default 2500)
+  FPV_CKPT   stop-and-save cadence in GLOBAL steps (default 2500)
   FPV_RUN    run dir (default D:\fpv\rl\runs\follow_v1)
+  FPV_AUTORESUME  "1" => resume from ckpt/ckpt_latest.zip + replay buffer when
+             present (ckpt_utils.find_resume); the old progress.csv is rotated
+             to progress_part_HHMMSS.csv first because configure() truncates it
 
 Launch ONLY via the FPVTrain scheduled task pattern (console session, Blocks
 already up on the port pairs). Heartbeat file D:\fpv\ops\train_status.txt is
@@ -76,6 +79,14 @@ if __name__ == "__main__":
         from stable_baselines3.common.vec_env import SubprocVecEnv
 
         venv = SubprocVecEnv([partial(_make_env, k) for k in range(N)])
+        # ckpt_utils.py sits next to this file on the Yoga (D:\fpv\rl): STOP_AND_SAVE
+        # stop-and-save + FPV_AUTORESUME resume (Claude Code 2026-11-10, after the
+        # unplug risk -- same wiring as rl_train_obs_lr6_multi.py).
+        import ckpt_utils
+        AUTORESUME = os.environ.get("FPV_AUTORESUME") == "1"
+        _pc = os.path.join(RUN_DIR, "progress.csv")
+        if AUTORESUME and os.path.exists(_pc) and os.path.getsize(_pc) > 0:
+            os.replace(_pc, os.path.join(RUN_DIR, "progress_part_%s.csv" % time.strftime("%H%M%S")))  # configure() would truncate it
         logger = configure(RUN_DIR, ["csv", "stdout"])
 
         class Heartbeat(BaseCallback):
@@ -165,42 +176,39 @@ if __name__ == "__main__":
                     pass
                 return True
 
-        # 2026-11-09 fix: SB3 CheckpointCallback counts per-vec-step calls under SubprocVecEnv so save_freq=6000 never fired before 36k global steps -- waypoint_v2 lost 28.9k steps with empty ckpt/; block-change counter is immune.
-        class CkptEvery(BaseCallback):
-            def __init__(self, freq, ckpt_dir):
-                super().__init__()
-                self.freq = freq
-                self.ckpt_dir = ckpt_dir
-                self._last = 0
-
-            def _on_step(self):
-                block = self.num_timesteps // self.freq
-                if block != self._last and block > 0:
-                    self._last = block
-                    try:
-                        tmp = os.path.join(self.ckpt_dir, 'tmp_policy.zip')
-                        self.model.save(tmp)
-                        os.replace(tmp, os.path.join(self.ckpt_dir, 'ckpt_%d_steps.zip' % self.num_timesteps))
-                    except Exception:
-                        pass
-                    hb('CKPT steps=%d' % self.num_timesteps)
-                return True
-
+        # ckpt cadence now comes from ckpt_utils.make_save_callback (block-change
+        # counter, immune to the 2026-11-09 SubprocVecEnv pitfall that motivated
+        # the old CkptEvery: SB3 CheckpointCallback save_freq counts per-vec-step
+        # calls -- waypoint_v2 lost 28.9k steps with empty ckpt/). It also saves
+        # the replay buffer, which CkptEvery never did.
         # v7 proven recipe scaled for N envs. gradient_steps=2 (not 1) is
         # DELIBERATE: N=6 envs produce 6 new samples per vec-step, so 2 gradient
         # steps per update keeps the network-update / new-data ratio up versus the
         # single-env v7 run (which used gradient_steps=1 at 1 sample/step).
-        model = SAC(
-            "MlpPolicy", venv, learning_starts=500, buffer_size=50000,
-            batch_size=256, train_freq=1, gradient_steps=2, ent_coef="auto",
-            gamma=0.98, policy_kwargs=dict(net_arch=[64, 64]),
-            verbose=1, seed=0)
+        model = None
+        resumed = False
+        if AUTORESUME:
+            _z, _r = ckpt_utils.find_resume(os.path.join(RUN_DIR, "ckpt"))
+            if _z:
+                model = SAC.load(_z, env=venv)
+                if _r:
+                    model.load_replay_buffer(_r)
+                resumed = True
+                hb(f"RESUMED steps={model.num_timesteps} buffer={'yes' if _r else 'no'} from={os.path.basename(_z)}")
+        if model is None:
+            model = SAC(
+                "MlpPolicy", venv, learning_starts=500, buffer_size=50000,
+                batch_size=256, train_freq=1, gradient_steps=2, ent_coef="auto",
+                gamma=0.98, policy_kwargs=dict(net_arch=[64, 64]),
+                verbose=1, seed=0)
         cb = [Heartbeat(), MindDump(os.path.join(RUN_DIR, "mind")),
-              CkptEvery(int(os.environ.get('FPV_CKPT', '2500')), os.path.join(RUN_DIR, 'ckpt')),
+              ckpt_utils.make_save_callback(BaseCallback, os.path.join(RUN_DIR, "ckpt"), hb,
+                                            every=int(os.environ.get('FPV_CKPT', '2500'))),
               SuccessWatch(rew_thresh=60.0, len_thresh=60.0)]
         model.set_logger(logger)
 
-        model.learn(total_timesteps=TOTAL_STEPS, callback=cb)
+        model.learn(total_timesteps=max(1, TOTAL_STEPS - (model.num_timesteps if resumed else 0)),
+                    callback=cb, reset_num_timesteps=not resumed)
 
         model.save(os.path.join(RUN_DIR, "policy_final"))
         hb(f"TRAIN_DONE steps={model.num_timesteps}")

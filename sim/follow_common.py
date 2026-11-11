@@ -24,13 +24,17 @@ Spec sections implemented here:
       conf = clip(N(0.85,0.08), 0, 1); on miss the box is frozen and age++;
       latency: the box shown at step t is the GT box of step t-L, L ~ U{0,1}
       or set from FPV_LAT_MS hi/lo by the caller.
-  D7  reward v5 -> v6 (survival-shaped, NO positive terminal, terminals
-      bad-only). v6 (D11): the range term is GOAL-CONDITIONED on a
+  D7  reward v7 (D17, superseded v5 -> v6): survival-shaped, NO positive
+      terminal, terminals bad-only. The range term is GOAL-CONDITIONED on a
       per-episode desired range and a close-guard subtracts CLOSE_PENALTY
-      while the true range is inside CLOSE_GUARD:
-      r_step = 0.5*in_view + 0.4*center + 0.2*max(0,1-|log(dist/desired)|)
-               - 0.05*||a|| - 0.03*||a - a_prev|| - 0.02*||v||
+      (2.0) while the true range is inside CLOSE_GUARD (1.5 m):
+      r_step = 0.2*in_view + 0.3*center + 0.6*max(0,1-|log(dist/desired)|)
+               - 0.03*||a - a_prev||
                - CLOSE_PENALTY if dist < CLOSE_GUARD (per-step, NOT terminal)
+      with center = max(0, 1-||(cx_err, cy_err)||). v7 made range-keeping
+      DOMINANT (0.6) and DELETED v6's movement taxes -0.05*||a|| and
+      -0.02*||v|| (lingering had cost nothing); a_norm/v_norm stay in the
+      follow_reward() signature for call compatibility but are UNUSED.
       terminals: landed -10, flew-out -10, collision -20 (flew-out radius
       scales with desired per D11 in the env).
       Dominance is PROVEN offline by check_follow_reward.py (card hard rule).
