@@ -1,0 +1,1 @@
+python_mean_err=0.3315 wire_mean_err=0.3337 mean_abs_delta=0.0143 violations=0 terminated_any=False verdict=LOOPBACK_OK

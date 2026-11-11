@@ -1,0 +1,10 @@
+run,steps,mean_err,final_err,terminated
+python_ep0,120,0.338028,0.399433,False
+python_ep1,120,0.341668,0.466249,False
+python_ep2,120,0.322071,0.417435,False
+python_ep3,120,0.324149,0.498882,False
+wire_ep0,120,0.340595,0.404175,False
+wire_ep1,120,0.342481,0.461769,False
+wire_ep2,120,0.321852,0.419137,False
+wire_ep3,120,0.329689,0.509443,False
+python_mean_err,,0.331479,,
