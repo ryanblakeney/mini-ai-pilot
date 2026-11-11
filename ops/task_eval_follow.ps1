@@ -45,6 +45,7 @@ try {
     exit 2
   }
   LogW "PORT_8989_UP after $([math]::Round(((Get-Date) - $t0).TotalSeconds, 1))s"
+  $evalStart = Get-Date
   $job = Start-Process -FilePath 'D:\fpv\venv312\Scripts\python.exe' -ArgumentList 'D:\fpv\rl\rl_eval_follow.py' -WorkingDirectory 'D:\fpv\ProjectAirSim\client\python\example_user_scripts' -RedirectStandardOutput "$ops\eval_follow_out.txt" -RedirectStandardError "$ops\eval_follow_err.txt" -PassThru -NoNewWindow
   LogW "EVALFOLLOW_STARTED pid=$($job.Id)"
   try { $job | Wait-Process -Timeout 2400 -ErrorAction Stop } catch { }
@@ -52,11 +53,24 @@ try {
     LogW 'EVALFOLLOW_TIMEOUT_2400S_KILLING_PYTHON'
     Stop-Process -Id $job.Id -Force -EA SilentlyContinue
   }
-  # success = follow_v1 eval_result.txt has a non-empty last line (ExitCode is $null in PS 5.1).
-  $res = 'D:\fpv\rl\runs\follow_v1\eval_result.txt'
+  # success = python exited clean (or ExitCode unavailable in PS 5.1), stdout has no
+  # EVAL_FAILED marker, AND eval_result.txt is FRESH (written after this run started).
+  # A previous run's result file must never read as OK (false-OK incident 2026-11-11).
+  $reason = ''
+  $code = $null
+  try { $code = $job.ExitCode } catch { }
+  if ($null -ne $code -and $code -ne 0) { $reason = 'exit_code' }
+  if (-not $reason -and (Select-String -Path "$ops\eval_follow_out.txt" -Pattern 'EVAL_FAILED' -Quiet -EA SilentlyContinue)) { $reason = 'eval_failed_marker' }
   $tail = ''
-  if (Test-Path $res) { $tail = (Get-Content $res -Tail 1 -EA SilentlyContinue) }
-  if ($tail) { LogW "EVALFOLLOW_OK result_tail=$tail" } else { LogW 'EVALFOLLOW_NO_RESULT_LINE' }
+  if (-not $reason) {
+    $res = 'D:\fpv\rl\runs\follow_v1\eval_result.txt'
+    $resultFile = Get-Item $res -EA SilentlyContinue
+    if ($resultFile -and $resultFile.LastWriteTime -gt $evalStart.AddSeconds(-5)) {
+      $tail = (Get-Content $res -Tail 1 -EA SilentlyContinue)
+    }
+    if (-not $tail) { $reason = 'stale_result' }
+  }
+  if ($reason) { LogW "EVALFOLLOW_FAILED reason=$reason" } else { LogW "EVALFOLLOW_OK result_tail=$tail" }
 } finally {
   Stop-Process -Name 'Blocks*' -Force -EA SilentlyContinue
   LogW 'BLOCKS_STOPPED'
