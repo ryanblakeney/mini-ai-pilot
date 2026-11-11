@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline proof for the S7 follow reward v6 (D7 + D11) -- the card's HARD RULE.
+"""Offline proof for the S7 follow reward v7 (D7 + D11 + D17) -- the card's HARD RULE.
 
 NO sim, NO third-party deps beyond numpy -- runs under plain
 /usr/bin/python3 (follow_common.py is pure, so a direct import is safe; the
@@ -9,10 +9,10 @@ module).
 Card hard rule, restated for S7: survival-shaped POSITIVE per-step reward
 (ceiling 1.1) with NO positive terminal anywhere, and bad-only terminals
 (landed -10, flew-out -10, collision -20) whose penalty magnitude exceeds any
-harvest obtainable from ending early. v6 adds the D11 goal-conditioning: the
-range term is |log(dist/desired)| around a PER-EPISODE desired range. Every
-Q3 hover stage died of violating exactly this; this checker PROVES the
-arithmetic numerically:
+harvest obtainable from ending early. v7 (D17): range-keeping is the DOMINANT
+term (in_view 0.2 + center 0.3 + range 0.6, log-form per D11) and the movement
+taxes -0.05*||a|| / -0.02*||v|| are gone; -0.03*||a-a_prev|| smoothness, the
+close-guard and the bad-only terminals are unchanged. The numerical proof:
 
   (a) camping/hover-at-start full-episode total < decent-tracking total,
       evaluated by SIMULATING both behaviours through the real target
@@ -25,10 +25,19 @@ arithmetic numerically:
       harvest -- plus the literal per-step bound |P| > per-step max 1.1;
   (c) the ordering survives gamma = 0.98 discounting (FOLLOW_D > CAMP_D for
       every (desired, kind));
-  (c2) close-guard sanity (v6): a too-close steady-state return is strictly
+  (c2) close-guard sanity: a too-close steady-state return is strictly
       below the tracking steady-state return -- the CLOSE_PENALTY 2.0 per
-      step dominates the max 0.2 range-term gain, and R_STEP_FLOOR prints
+      step dominates the max 0.6 range-term gain, and R_STEP_FLOOR prints
       the worst non-terminal per-step floor = -(CLOSE_PENALTY + penalties);
+  (c3) ADVERSARIAL TIER 'hover-and-pan' (D17 -- THE loophole the v6 reward
+      had): drone takes zero velocity action (v stays ~0) but pans yaw to
+      keep the RECEDING scripted target in view and centered. On every
+      followable-speed receding script (person/bicycle -- car structurally
+      outruns the +-1 m/s drone per D2 and is reported, not asserted, as the
+      documented uncatchable parity family) the hover-and-pan return is
+      STRICTLY below the follow return of the SAME script (paired target
+      script + paired detector-noise seed), and the cell means dominate at
+      EVERY (desired, kind);
   (d) projection sanity (D4) + apparent-size range_estimate inversion (D12)
       + RangeEstimator EMA/dropout semantics;
   (e) noise-model statistics over 10k draws (miss rate, jitter std, h mult
@@ -57,9 +66,9 @@ DRONE0 = np.array([0.0, 0.0, -4.7])   # settled takeoff height (ground -2.7)
 # D11: the goal-conditioning sweep -- the dominance proof must hold at EVERY
 # desired range a policy can be conditioned on (env knobs default 1.5..15).
 DESIRED_SWEEP = [1.5, 3.0, 6.0, 10.0, 15.0]
-# worst-case penalty magnitudes (Box(4) +-1 actions, +-2 m/s action deltas,
-# <= 3 m/s airspeed in this env):
-PEN_MAX = 0.05 * 2.0 + 0.03 * 4.0 + 0.02 * 3.0
+# worst-case penalty magnitudes (v7: smoothness only -- Box(4) actions give
+# action deltas up to norm 4):
+PEN_MAX = 0.03 * 4.0
 R_STEP_FLOOR = -(fc.CLOSE_PENALTY + PEN_MAX)   # worst non-terminal step
 
 
@@ -68,7 +77,7 @@ def dsum(k, per_step):
     return per_step * sum(GAMMA ** t for t in range(1, k + 1))
 
 
-def rollout(kind, rng, mode, desired):
+def rollout(kind, rng, mode, desired, script=None, noise=None):
     """One natural-script episode through the REAL primitives, goal-conditioned.
 
     mode='camp'  : hover-at-start (zero action, zero yaw).
@@ -78,12 +87,20 @@ def rollout(kind, rng, mode, desired):
                    the target kinematically outruns the drone (car/bike net
                    speed) the policy honestly loses range/view like any real
                    policy would.
-    Detector: default D6 noise (p_miss=0.15, jitter, age-out K_VIEW).
-    Returns (total, per-step income list).
+    mode='pan'   : ADVERSARIAL 'hover-and-pan' (D17): zero velocity action --
+                   v stays exactly 0, drone never translates -- but the SAME
+                   yaw servo as chase keeps the receding target in view and
+                   centered. This is the v6 loophole behaviour.
+    script/noise may be INJECTED (paired target script + paired detector-noise
+    seed) so per-script pan-vs-follow comparisons share everything but the
+    behaviour. Detector default otherwise: D6 noise (p_miss=0.15, jitter,
+    age-out K_VIEW). Returns (total, per-step income list).
     """
-    script = fc.sample_target(rng, kind, drone_start=DRONE0, drone_yaw=0.0,
-                              desired=desired)
-    noise = fc.DetectorNoise(rng)
+    if script is None:
+        script = fc.sample_target(rng, kind, drone_start=DRONE0,
+                                  drone_yaw=0.0, desired=desired)
+    if noise is None:
+        noise = fc.DetectorNoise(rng)
     cam = fc.default_cam()
     pos = DRONE0.copy()
     yaw = 0.0
@@ -98,12 +115,12 @@ def rollout(kind, rng, mode, desired):
             dxy = tp[:2] - pos[:2]
             hd = float(math.hypot(dxy[0], dxy[1]))
             gap = hd - desired                    # hold the DESIRED band (D11)
-            if hd > 1e-9 and abs(gap) > 0.5:
+            if mode == "chase" and hd > 1e-9 and abs(gap) > 0.5:
                 sp = min(1.0, abs(gap))           # speed cap ~1 m/s along LOS
                 ux, uy = dxy[0] / hd, dxy[1] / hd
                 vn, ve = (sp * ux, sp * uy) if gap > 0 else (-sp * ux,
                                                              -sp * uy)
-            else:
+            else:                                 # pan: never translates
                 vn, ve = 0.0, 0.0
             psi_err = math.atan2(math.sin(math.atan2(dxy[1], dxy[0]) - yaw),
                                  math.cos(math.atan2(dxy[1], dxy[0]) - yaw))
@@ -155,30 +172,32 @@ def main():
     assert f(0.0, 0.0, 6.0, True, 0.0, 0.0, 0.0,
              collided=True, landed=True) == -20.0     # collision outranks
     assert f(0.0, 0.0, 6.0, True, 0.0, 0.0, 0.0) <= 1.1 + 1e-12
-    assert abs(f(0.0, 0.0, 6.0, False, 0.0, 0.0, 0.0) - 0.6) < 1e-12
+    assert abs(f(0.0, 0.0, 6.0, False, 0.0, 0.0, 0.0) - 0.9) < 1e-12
     assert f(2.0, 2.0, 100.0, False, 0.0, 0.0, 0.0) == 0.0  # true floor, no penalties
     assert abs(f(0.0, 0.0, 6.0, True, 0.0, 0.0, 0.0) - 1.1) < 1e-12
 
-    # ---- v6 goal-conditioning + close-guard direct checks ------------------
+    # ---- v7 goal-conditioning + close-guard direct checks ------------------
+    # v7 movement taxes: a_norm/v_norm are signature-only (unused in the sum).
+    assert f(0, 0, 6.0, True, 2.0, 0.0, 3.0) == f(0, 0, 6.0, True, 0.0, 0.0, 0.0)
     # range term is goal-conditioned: same episode geometry, different goals
     assert abs(f(0, 0, 8.0, True, 0, 0, 0, desired=8.0)
                - (1.1)) < 1e-12                        # perfect at ANY goal
     assert abs(f(0, 0, 8.0, True, 0, 0, 0, desired=2.0)
-               - (0.5 + 0.4 + 0.2 * max(0.0, 1 - abs(math.log(4.0))))) < 1e-12
+               - (0.2 + 0.3 + 0.6 * max(0.0, 1 - abs(math.log(4.0))))) < 1e-12
     # log form is SCALE-FREE: identical relative error => identical term at
     # the near and far ends of the D11 sweep (the whole point of D11).
     assert abs(f(0, 0, 1.5 * 1.3, True, 0, 0, 0, desired=1.5)
                - f(0, 0, 15.0 * 1.3, True, 0, 0, 0, desired=15.0)) < 1e-12
-    # close-guard (v6): per-step subtraction, NOT a terminal
+    # close-guard (v6, kept in v7): per-step subtraction, NOT a terminal
     g_dist = 1.4
-    expect_g = (0.5 + 0.4 + 0.2 * max(0.0, 1 - abs(math.log(g_dist / 1.5)))
+    expect_g = (0.2 + 0.3 + 0.6 * max(0.0, 1 - abs(math.log(g_dist / 1.5)))
                 - fc.CLOSE_PENALTY)
     assert abs(f(0, 0, g_dist, True, 0, 0, 0, desired=1.5) - expect_g) < 1e-12
     assert f(0, 0, 1.2, True, 0, 0, 0, landed=True) == -10.0   # guard NOT terminal
     assert fc.CLOSE_GUARD == 1.5 and fc.CLOSE_PENALTY == 2.0
     # worst non-terminal per-step floor (printed for the launch card):
-    # all shaping terms zero (no in_view, no center, no range) + full
-    # penalties + the close-guard subtraction.
+    # all shaping terms zero (no in_view, no center, no range) + the max
+    # smoothness penalty + the close-guard subtraction.
     assert abs(f(9, 9, 0.05, False, 2.0, 4.0, 3.0, desired=1.5)
                - R_STEP_FLOOR) < 1e-12
     assert f(9, 9, 0.05, True, 2.0, 4.0, 3.0, desired=1.5) >= R_STEP_FLOOR
@@ -196,6 +215,7 @@ def main():
     # per-visible-step scoring at eval time (rl_eval_follow.py).
     mean_camp, mean_foll, camp_tot, foll_tot = {}, {}, {}, {}
     camp_cum = None                                    # worst-case profile
+    camp_cum_cell = {}                                 # per (goal, kind) mean
     r_track_min_by_d = {}
     for d_want in DESIRED_SWEEP:
         rmin_d = 1e18
@@ -204,6 +224,7 @@ def main():
             camp_tot[(d_want, kind)], foll_tot[(d_want, kind)] = c, fl
             mean_camp[(d_want, kind)] = float(np.mean(c))
             mean_foll[(d_want, kind)] = float(np.mean(fl))
+            camp_cum_cell[(d_want, kind)] = cum
             camp_cum = cum if camp_cum is None else np.maximum(camp_cum, cum)
             assert mean_camp[(d_want, kind)] < mean_foll[(d_want, kind)], \
                 (d_want, kind, mean_camp[(d_want, kind)],
@@ -236,14 +257,24 @@ def main():
                 assert rho + P < rho + zero_floor * (MAX_STEPS - k)
     # Report (informative; not the incentive claim): the best absolute
     # terminal-ending episode total, vs the tracking expectation it must lose
-    # to -- a terminal-cut shortens the SAME income stream by >= |P|:
+    # to -- a terminal-cut shortens the SAME income stream by >= |P|. Under
+    # D11 goal-conditioning the comparison is PER CELL: the prefix profile and
+    # the follow expectation must come from the SAME (desired, kind) family
+    # (a camp prefix at desired=15 and a car chase at desired=1.5 are
+    # different episodes -- the policy is conditioned on the goal).
+    for key, cum_c in camp_cum_cell.items():
+        cell_best_term = max(cum_c[k] + P
+                             for P in (fc.TERM_LANDED, fc.TERM_FLEW_OUT,
+                                       fc.TERM_COLLISION)
+                             for k in range(0, MAX_STEPS))
+        assert cell_best_term < mean_foll[key], (key, cell_best_term,
+                                                 mean_foll[key])
     worst_term, worst_arg = -1e18, None
-    for P in (fc.TERM_LANDED, fc.TERM_FLEW_OUT, fc.TERM_COLLISION):
-        for k in range(0, MAX_STEPS):
-            prof = max(camp_cum[k], r_track_min * k)
-            if prof + P > worst_term:
-                worst_term, worst_arg = prof + P, (P, k)
-    assert worst_term < FOLL_MEAN_MIN
+    for key, cum_c in camp_cum_cell.items():
+        for P in (fc.TERM_LANDED, fc.TERM_FLEW_OUT, fc.TERM_COLLISION):
+            for k in range(0, MAX_STEPS):
+                if cum_c[k] + P > worst_term:
+                    worst_term, worst_arg = cum_c[k] + P, (key, P, k)
 
     # ---- (c) gamma = 0.98 discounting preserves the ordering, per goal -----
     # discounted proof runs per (goal, kind) on MATCHED expectations: the
@@ -287,7 +318,7 @@ def main():
     # a decent tracking step OUTSIDE the guard: on-band (1.15x desired),
     # near-centered, moving (this is the profile the guard must lose to):
     r_track_step = f(0.05, 0.0, 6.9, True, 0.8, 0.1, 0.9, desired=6.0)
-    assert fc.CLOSE_PENALTY > 0.2                  # penalty > max range gain
+    assert fc.CLOSE_PENALTY > 0.6                  # penalty > max range gain
     assert r_close < 0.0 < r_track_step
     for d_want in DESIRED_SWEEP:                   # at EVERY goal in the sweep
         rc = f(0, 0, min(d_want, fc.CLOSE_GUARD - 0.01), True, 0, 0, 0,
@@ -298,6 +329,50 @@ def main():
         assert dsum(30, rc) < dsum(30, rt), (d_want, rc, rt)
     CLOSE_D = dsum(30, r_close)
     TRACK_D_GUARD = dsum(30, r_track_step)
+
+    # ---- (c3) ADVERSARIAL TIER 'hover-and-pan' (D17 -- the v6 loophole) -----
+    # The drone NEVER translates (zero velocity action, v stays 0) and only
+    # pans yaw to keep the RECEDING scripted target in view and centered --
+    # exactly the behaviour v6 rewarded ~0.9/step for while the target walked
+    # away. Paired comparison: SAME target script + SAME detector-noise seed
+    # per pair (everything but the behaviour cancels). Scripts are filtered
+    # to RECEDING ones (endpoint further from the drone than the start by
+    # >2 m) -- the loophole family. Per-script STRICT dominance is asserted
+    # for the followable-speed kinds (person 0.8 m/s < the +-1 m/s drone;
+    # bicycle -- closing at 1 m/s stays strictly nearer every step). CAR
+    # structurally outruns the drone (D2 "short chase windows by design"):
+    # pan is ~optimal vs an uncatchable target, per-script parity there is
+    # CORRECT RL behaviour, not a loophole -- car cells are asserted on
+    # strict MEAN dominance and the near-parity count is reported honestly
+    # (same documented uncatchable stress family as the D7 open-risk-3 note).
+    rng_hp = random.Random(20261111)
+    hp_stats = []
+    for d_want in DESIRED_SWEEP:
+        for kind in ("person", "bicycle", "car"):
+            pairs = []
+            tries = 0
+            while len(pairs) < 60 and tries < 600:
+                tries += 1
+                s = fc.sample_target(rng_hp, kind, drone_start=DRONE0,
+                                     drone_yaw=0.0, desired=d_want)
+                d0 = float(np.hypot(*(s["xy"][0] - DRONE0[:2])))
+                d1 = float(np.hypot(*(s["xy"][-1] - DRONE0[:2])))
+                if d1 <= d0 + 2.0:
+                    continue
+                seed = rng_hp.randrange(1 << 62)
+                tp_t, _ = rollout(kind, rng_hp, "pan", d_want, script=s,
+                                  noise=fc.DetectorNoise(random.Random(seed)))
+                tc_t, _ = rollout(kind, rng_hp, "chase", d_want, script=s,
+                                  noise=fc.DetectorNoise(random.Random(seed)))
+                pairs.append((tp_t, tc_t))
+            m_pan = float(np.mean([p for p, _ in pairs]))
+            m_fol = float(np.mean([c for _, c in pairs]))
+            worst_ratio = max(p / c for p, c in pairs)
+            flips = sum(1 for p, c in pairs if p >= c)
+            assert m_pan < m_fol, (d_want, kind, m_pan, m_fol)
+            if kind != "car":
+                assert flips == 0, (d_want, kind, flips)
+            hp_stats.append((d_want, kind, m_pan, m_fol, worst_ratio, flips))
 
     # ---- (d) projection sanity (D4) + range_estimate (D12) -----------------
     cam = fc.default_cam()
@@ -469,7 +544,7 @@ def main():
             assert lo - 1e-9 <= r0 <= hi + 1e-9, (d_want, r0)
 
     # ---- report --------------------------------------------------------------
-    print("follow reward v6 dominance table (episode returns, %d steps,"
+    print("follow reward v7 dominance table (episode returns, %d steps,"
           " 60 natural scripts/kind/goal, real D6 detector):" % MAX_STEPS)
     print("  goal   %-9s  CAMP mean / max      TRACK mean / max" % "kind")
     for key in camp_tot:
@@ -479,11 +554,11 @@ def main():
     print("  (EXPECTED returns govern learning at EVERY desired in %s;"
           " receding-LOS scripts are the documented loss/re-acquire stress"
           " family -- spec open-risk 3)" % DESIRED_SWEEP)
-    print("  best TERMINAL-ending episode over all (P, k): %.2f at %s "
-          "< track mean-min %.2f; idle floor r=0 (safe range) makes early"
-          " termination a strict |P| loss from ANY state" % (worst_term,
-                                                             worst_arg,
-                                                             FOLL_MEAN_MIN))
+    print("  best TERMINAL-ending episode over all (goal,kind,P,k): %.2f at"
+          " %s -- each cell's best terminal cut stays below THAT cell's"
+          " follow expectation (global track mean-min %.2f); idle floor r=0"
+          " (safe range) makes early termination a strict |P| loss from ANY"
+          " state" % (worst_term, worst_arg, FOLL_MEAN_MIN))
     print("  per-step harvest ceiling %.1f < |P| for P in {-10,-10,-20}; "
           "post-terminal harvest = 0 (episode over); worst NON-terminal step"
           " R_STEP_FLOOR = %.2f = -(CLOSE_PENALTY %.1f + max penalties %.2f)"
@@ -491,11 +566,21 @@ def main():
     print("  gamma=%.2f: at every goal TRACK %.2f > CAMP %.2f (last pair);"
           " every discounted terminal cut < the SAME stream run on; best"
           " terminal %.2f" % (GAMMA, last_FD, last_CD, last_TD))
-    print("  close-guard v6: best step inside %.1f m = %.2f < decent track"
+    print("  close-guard: best step inside %.1f m = %.2f < decent track"
           " step %.2f; 30-step steady %.2f < %.2f; CLOSE_PENALTY %.1f > max"
-          " range-term gain 0.2" % (fc.CLOSE_GUARD, r_close, r_track_step,
+          " range-term gain 0.6" % (fc.CLOSE_GUARD, r_close, r_track_step,
                                      CLOSE_D, TRACK_D_GUARD,
                                      fc.CLOSE_PENALTY))
+    print("  hover-and-pan tier (D17): zero velocity + yaw-pan keeping the"
+          " RECEDING target in view/centered; paired script + noise,")
+    print("    60 receding scripts/cell -- PAN mean < FOLLOW mean at EVERY"
+          " cell; per-script STRICT on followable kinds (person, bicycle):")
+    for _dw, _kind, _mp, _mf, _wr, _fl in hp_stats:
+        print("    %5.1f  %-9s  PAN %7.2f  FOLLOW %7.2f  worst pan/follow"
+              " %.3f  flips %d%s"
+              % (_dw, _kind, _mp, _mf, _wr, _fl,
+                 "   (uncatchable per D2: mean-asserted;"
+                 " per-script parity reported)" if _kind == "car" else ""))
     print("  projection: h_px=%.1f vs f*H/dist=%.1f (<6%%), cx=%.0f==cx0;"
           " edge_cut set at 2 m, unset at 6/12 m" % (tgt["h_px"], approx,
                                                      tgt["cx"]))
@@ -509,7 +594,10 @@ def main():
           % g.min())
     print()
     print("asserts: mean_camp < mean_track for all kinds at every desired in"
-          " %s; idle floor r>=0 (safe range) makes every (P,k) terminal cut"
+          " %s; hover-and-pan return strictly below the follow return of the"
+          " SAME receding script on every followable-speed script and below"
+          " on every cell mean (car parity reported, D2); idle floor r>=0"
+          " (safe range) makes every (P,k) terminal cut"
           " strictly worse than continuing (undiscounted and discounted);"
           " close-guard steady return strictly below tracking steady;"
           " projection/range-estimate/noise/grid properties hold"

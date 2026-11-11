@@ -232,3 +232,51 @@ Deliberate choice: the follow_v1 TRAINING scenario stays UNCHANGED — the
 detour is an evaluation rung only; a follow_v2 candidate (detour in training
 + explicit d_min shaping) is on hold until the AVOID-vs-IBVS comparison
 actually shows a gap.
+
+## D17 Reward v7: range-dominant, movement-free (Claude Code 2026-11-11 hold)
+The hold: v6 pays ~0.9/step for JUST hovering and panning the camera while the
+target walks away (0.5 in_view + 0.4 center), while range keeping is only 0.2
+and movement is charged by -0.05||a|| - 0.02||v|| — the same linger-don't-move
+incentive that sank the TRL/TRL-b waypoint runs. Fix shipped: v7 =
+0.2*in_view + 0.3*center + 0.6*range_t - 0.03*||a-a_prev|| (CLOSE_PENALTY
+inside CLOSE_GUARD unchanged; terminals stay bad-only landed/flew-out -10,
+collision -20). The |a| and |v| taxes are DELETED; the smoothness term stays
+(it shapes HOW the drone moves, not whether); the log-form goal-conditioned
+range_t (D11) is kept and is now the DOMINANT term (per-step ceiling is still
+1.1 = 0.2+0.3+0.6; worst non-terminal step floor rises to -2.12 =
+-(CLOSE_PENALTY + 0.03*4)). a_norm/v_norm stay in follow_reward()'s signature
+for call compatibility but are unused in the sum. CLOSE_PENALTY 2.0 > the new
+max range gain 0.6, so the close-guard proof strengthens, not weakens.
+
+New adversarial checker tier 'hover-and-pan' (check_follow_reward.py (c3)):
+zero velocity action (v stays exactly 0), yaw servo keeps the RECEDING scripted
+target in view and centered — the v6 loophole behaviour. Paired comparison
+(SAME target script + SAME detector-noise seed per pair), 60 receding scripts
+per cell, real D6 noise. v7 episode returns (PAN vs FOLLOW of the same
+script): person PAN 29.9/33.8/38.3/46.6/53.9 vs FOLLOW 61.0/90.8/89.7/87.0/
+84.8 at goals 1.5/3/6/10/15 (worst script ratios 0.45–0.54 for goals 1.5–6,
+0.72 at 10, 0.86 at 15); bicycle PAN 25.1/26.6/28.8/31.3/34.0 vs FOLLOW
+27.4/29.6/33.0/36.8/41.9 (worst ratio 0.86–0.94); per-script dominance is
+STRICT on every one of the 600 person/bicycle scripts (0 flips) and asserted
+by the checker. CAR structurally outruns the ±1 m/s drone (D2, "short chase
+windows by design"), so pan-vs-follow there is near-parity (cell means still
+strict: e.g. 24.8 vs 25.3 at goal 10; 2/300 per-script flips) — pan being
+~optimal vs an uncatchable target is correct RL behaviour, not a loophole;
+car cells are asserted on strict means and the flips are reported, not hidden.
+
+The hold's contingency clause — switch to a potential-based range term
+F = gamma*Phi(s') - Phi(s), Phi = -|log(dist/desired)| (Ng et al. 1999) if
+hover-and-pan came within 10% of follow on any script — WAS triggered (bicycle
+worst ratio 0.94, car ~1.0) and WAS measured on the identical tier: the
+potential form is WORSE, not better (30–34 per-script flips across the 15
+cells vs raw 0/1200 on followable kinds; worst script ratio 1.19 — a goal-15
+person script where hover-and-pan BEATS follow), because the discounted
+telescoping sum collapses to gamma^101*Phi_T - gamma*Phi_0 and washes out the
+range-keeping advantage on exactly the catchable scripts where the loophole
+mattered (the potential form flipped 18/60 scripts in the person goal-15 cell
+alone). Additionally the pure fixed-signature follow_reward() cannot see
+s_prev, which F requires. RAW 0.6*range_t is therefore what ships; the escape
+clause is recorded here as investigated-and-rejected with numbers, and the
+loophole it targeted is closed by the raw dominant range term itself
+(per-cell mean, person FOLLOW earns 1.6–2.7x the pan return; per-script worst
+ratio 0.86 on 600 followable receding scripts, 0 flips).

@@ -25,9 +25,10 @@ keep the target centered at the desired range.
             est yet), desired/15.0, range_valid 0/1 (usable THIS step),
             conf, age/10 (clipped) + [15] depth grid row-major
             ((d-1)/19, free=1.0).
-  reward  = reward v6, PURE follow_reward() in follow_common.py (D7 + D11:
-            goal-conditioned range term, close-guard -2.0/step inside 1.5 m,
-            NO positive terminal); dominance PROVEN offline by
+  reward  = reward v7, PURE follow_reward() in follow_common.py (D7 + D11 +
+            D17: goal-conditioned range term DOMINANT (0.2/0.3/0.6 in_view/
+            center/range, no |a|/|v| taxes), close-guard -2.0/step inside
+            1.5 m, NO positive terminal); dominance PROVEN offline by
             check_follow_reward.py before any launch (card hard rule -- the
             Q3 hover killers).
   term    = collision -20 | landed -10 | > max(12, desired+8) m from START

@@ -485,10 +485,10 @@ def detour_target(script, center, drone_start, rng, extra_lo=3.0,
 
 
 # ---------------------------------------------------------------------------
-# reward v6 (D7 + D11) -- PURE, dominance-proven by check_follow_reward.py
+# reward v7 (D7 + D11 + D17) -- PURE, dominance-proven by check_follow_reward.py
 # ---------------------------------------------------------------------------
 
-R_STEP_CEILING = 1.1          # 0.5 + 0.4 + 0.2, penalties only subtract
+R_STEP_CEILING = 1.1          # 0.2 + 0.3 + 0.6, penalties only subtract
 TERM_LANDED = -10.0           # drone landed mid-episode (D7)
 TERM_FLEW_OUT = -10.0         # > leave-radius from start (D7, radius per D11)
 TERM_COLLISION = -20.0        # collision with anything (D7)
@@ -501,17 +501,26 @@ K_VIEW = 20                   # steps until a lost box "ages out" (D7)
 def follow_reward(cx_err, cy_err, dist, in_view, a_norm, da_norm, v_norm,
                   landed=False, flew_out=False, collided=False,
                   desired=DIST_STAR):
-    """S7 follow reward v6 (D7 + D11) -- PURE function, no sim imports.
+    """S7 follow reward v7 (D7 + D11 + D17) -- PURE function, no sim imports.
 
     Survival-shaped, NO positive terminal anywhere; terminals are bad-only
     and their magnitudes exceed anything that early termination can harvest
     (proved by check_follow_reward.py -- the failure mode that killed all the
     Q3 hover stages). check order: collided -> landed/flew_out -> per-step.
 
-        r = 0.5*in_view + 0.4*max(0,1-|cx_err,cy_err|)
-            + 0.2*max(0,1-|log(dist/desired)|)
-            - 0.05*||a|| - 0.03*||a-a_prev|| - 0.02*||v||
+        r = 0.2*in_view + 0.3*max(0,1-|cx_err,cy_err|)
+            + 0.6*max(0,1-|log(dist/desired)|)
+            - 0.03*||a-a_prev||
             - CLOSE_PENALTY if dist < CLOSE_GUARD   (per-step, NOT terminal)
+
+    v7 (D17, Claude Code 2026-11-11 hold): range-keeping is the DOMINANT
+    term (0.6 vs v6's 0.2) and the movement taxes -0.05*||a|| and -0.02*||v||
+    are DELETED -- v6 could earn ~0.9/step just hovering while panning the
+    camera as the target walked away, while moving cost reward: the same
+    linger-don't-move incentive that sank the TRL/TRL-b waypoint runs. The
+    smoothness term -0.03*||a-a_prev|| stays (it shapes how the drone moves,
+    not whether). NOTE: a_norm and v_norm are KEPT IN THE SIGNATURE for call
+    compatibility (follow_env.py passes them) but are now UNUSED in the sum.
 
     GOAL-CONDITIONED (D11): `desired` is the per-episode follow range the
     policy is conditioned on (obs block carries it, D13). the owner's literal ask
@@ -522,10 +531,11 @@ def follow_reward(cx_err, cy_err, dist, in_view, a_norm, da_norm, v_norm,
     gives 1.5 m and 15 m episodes EQUAL weighting (same relative error =
     same term), which is the whole point of goal-conditioning.
 
-    Close-guard (v6): inside CLOSE_GUARD metres the step loses CLOSE_PENALTY
-    every step -- NOT a terminal (terminals stay bad-only landed/flew-out -10,
-    collision -20). The checker proves 2.0 > the max 0.2 range-term gain, so
-    parking on top of the target can never pay even with range_term = 0.2.
+    Close-guard (v6, unchanged in v7): inside CLOSE_GUARD metres the step
+    loses CLOSE_PENALTY every step -- NOT a terminal (terminals stay bad-only
+    landed/flew-out -10, collision -20). The checker proves 2.0 > the max
+    0.6 range-term gain, so parking on top of the target can never pay even
+    with range_term = 0.6.
     """
     if collided:
         return TERM_COLLISION
@@ -533,8 +543,8 @@ def follow_reward(cx_err, cy_err, dist, in_view, a_norm, da_norm, v_norm,
         return TERM_LANDED
     center = max(0.0, 1.0 - math.hypot(cx_err, cy_err))
     range_t = max(0.0, 1.0 - abs(math.log(max(dist, 0.05) / desired)))
-    r = (0.5 * (1.0 if in_view else 0.0) + 0.4 * center + 0.2 * range_t
-         - 0.05 * a_norm - 0.03 * da_norm - 0.02 * v_norm)
+    r = 0.2 * (1.0 if in_view else 0.0) + 0.3 * center + 0.6 * range_t \
+        - 0.03 * da_norm
     if dist < CLOSE_GUARD:
         r -= CLOSE_PENALTY
     return r
