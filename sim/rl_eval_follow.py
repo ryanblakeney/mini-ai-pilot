@@ -20,6 +20,8 @@ Verdict is baked in:
           AND policy_mean_loss <= ibvs_mean_loss
 Per-visible-step reporting per spec risk 3: loss (frag) time is a first-class
 column, not folded into center err. os._exit at end (Win teardown segfault).
+Baseline-only mode: if no policy file exists at FPV_POLICY, the stable_baselines3
+import and model load are skipped, only zero + ibvs run, verdict=BASELINE_RECORDED.
 """
 import csv
 import os
@@ -30,6 +32,7 @@ import traceback
 RL_DIR = r"D:\fpv\rl"
 RUN_DIR = os.environ.get("FPV_RUN", RL_DIR + r"\runs\follow_v1")
 POLICY = os.environ.get("FPV_POLICY", os.path.join(RUN_DIR, "policy_final.zip"))
+baseline_only = (not os.path.exists(POLICY))
 OUT = r"D:\fpv\ops\eval_out.txt"
 N_EPISODES = 4
 MAX_STEPS_EVAL = 120
@@ -56,16 +59,19 @@ try:
     env = FollowDroneEnv(step_dt=0.5, max_steps=MAX_STEPS_EVAL)
     n_act = int(env.action_space.shape[0])
 
-    # policy load: SAC first (house algo), PPO fallback
-    from stable_baselines3 import PPO, SAC
-    try:
-        model = SAC.load(POLICY, env=env)
-        algo = "SAC"
-    except Exception:
-        model = PPO.load(POLICY, env=env)
-        algo = "PPO"
-    log(f"POLICY={POLICY} ALGO={algo} COLL_ROUTE="
-        f"{getattr(env, 'collision_route', '?')} YAW_DIMS={n_act}")
+    if not baseline_only:
+        # policy load: SAC first (house algo), PPO fallback
+        from stable_baselines3 import PPO, SAC
+        try:
+            model = SAC.load(POLICY, env=env)
+            algo = "SAC"
+        except Exception:
+            model = PPO.load(POLICY, env=env)
+            algo = "PPO"
+        log(f"POLICY={POLICY} ALGO={algo} COLL_ROUTE="
+            f"{getattr(env, 'collision_route', '?')} YAW_DIMS={n_act}")
+    else:
+        log(f"BASELINE_ONLY no policy at {POLICY} - measuring zero + ibvs")
 
     def run_episode(acting, seed, e=None):
         """One episode; list of (center_err, dist, in_view, loss, collided)."""
@@ -133,7 +139,7 @@ try:
 
     zero_rows = run_tagged("zero_ep", zero_act, "ZERO")
     ibvs_rows = run_tagged("ibvs_ep", ibvs_act, "IBVS", reset=ibvs.reset)
-    pol_rows = run_tagged("policy_ep", policy_act, "EP")
+    pol_rows = [] if baseline_only else run_tagged("policy_ep", policy_act, "EP")
 
     env.close()
 
@@ -142,30 +148,49 @@ try:
                 float(np.mean([r[5] for r in rs])),
                 int(sum(bool(r[6]) for r in rs)))
 
-    pol_c, pol_loss, pol_coll = agg(pol_rows)
     ibv_c, ibv_loss, ibv_coll = agg(ibvs_rows)
     zer_c, zer_loss, zer_coll = agg(zero_rows)
-    ok = (pol_c < ibv_c and pol_c < zer_c and pol_coll == 0
-          and pol_loss <= ibv_loss)
-    verdict = "FOLLOW_OK" if ok else "FOLLOW_NOT_LEARNED"
-    log(f"POLICY_MEAN_CENTER={pol_c:.3f} IBVS_MEAN_CENTER={ibv_c:.3f} "
-        f"ZERO_MEAN_CENTER={zer_c:.3f} POLICY_LOSS={pol_loss} "
-        f"IBVS_LOSS={ibv_loss} ZERO_LOSS={zer_loss} "
-        f"COLLISIONS={pol_coll}/{N_EPISODES} "
-        f"IBVS_COLLISIONS={ibv_coll}/{N_EPISODES} "
-        f"ZERO_COLLISIONS={zer_coll}/{N_EPISODES} VERDICT={verdict}")
+    pol_c = pol_loss = pol_coll = None  # unused in baseline-only mode
+    if baseline_only:
+        verdict = "BASELINE_RECORDED"
+        log(f"POLICY_MEAN_CENTER=NA IBVS_MEAN_CENTER={ibv_c:.3f} "
+            f"ZERO_MEAN_CENTER={zer_c:.3f} POLICY_LOSS=NA "
+            f"IBVS_LOSS={ibv_loss} ZERO_LOSS={zer_loss} "
+            f"COLLISIONS=NA "
+            f"IBVS_COLLISIONS={ibv_coll}/{N_EPISODES} "
+            f"ZERO_COLLISIONS={zer_coll}/{N_EPISODES} VERDICT={verdict}")
+    else:
+        pol_c, pol_loss, pol_coll = agg(pol_rows)
+        ok = (pol_c < ibv_c and pol_c < zer_c and pol_coll == 0
+              and pol_loss <= ibv_loss)
+        verdict = "FOLLOW_OK" if ok else "FOLLOW_NOT_LEARNED"
+        log(f"POLICY_MEAN_CENTER={pol_c:.3f} IBVS_MEAN_CENTER={ibv_c:.3f} "
+            f"ZERO_MEAN_CENTER={zer_c:.3f} POLICY_LOSS={pol_loss} "
+            f"IBVS_LOSS={ibv_loss} ZERO_LOSS={zer_loss} "
+            f"COLLISIONS={pol_coll}/{N_EPISODES} "
+            f"IBVS_COLLISIONS={ibv_coll}/{N_EPISODES} "
+            f"ZERO_COLLISIONS={zer_coll}/{N_EPISODES} VERDICT={verdict}")
 
     with open(os.path.join(RUN_DIR, "eval_result.txt"), "w") as f:
-        f.write(f"verdict={verdict}\n"
-                f"policy_mean_center={pol_c:.4f}\n"
-                f"ibvs_mean_center={ibv_c:.4f}\n"
-                f"zero_mean_center={zer_c:.4f}\n"
-                f"policy_loss_steps={pol_loss}\n"
-                f"ibvs_loss_steps={ibv_loss}\n"
-                f"zero_loss_steps={zer_loss}\n"
-                f"policy_collisions={pol_coll}\n"
-                f"ibvs_collisions={ibv_coll}\n"
-                f"zero_collisions={zer_coll}\n")
+        if baseline_only:
+            f.write(f"verdict={verdict}\n"
+                    f"ibvs_mean_center={ibv_c:.4f}\n"
+                    f"zero_mean_center={zer_c:.4f}\n"
+                    f"ibvs_loss_steps={ibv_loss}\n"
+                    f"zero_loss_steps={zer_loss}\n"
+                    f"ibvs_collisions={ibv_coll}\n"
+                    f"zero_collisions={zer_coll}\n")
+        else:
+            f.write(f"verdict={verdict}\n"
+                    f"policy_mean_center={pol_c:.4f}\n"
+                    f"ibvs_mean_center={ibv_c:.4f}\n"
+                    f"zero_mean_center={zer_c:.4f}\n"
+                    f"policy_loss_steps={pol_loss}\n"
+                    f"ibvs_loss_steps={ibv_loss}\n"
+                    f"zero_loss_steps={zer_loss}\n"
+                    f"policy_collisions={pol_coll}\n"
+                    f"ibvs_collisions={ibv_coll}\n"
+                    f"zero_collisions={zer_coll}\n")
         for r in rows:
             f.write(",".join(str(x) for x in r) + "\n")
     with open(os.path.join(RUN_DIR, "eval.csv"), "w", newline="") as f:
