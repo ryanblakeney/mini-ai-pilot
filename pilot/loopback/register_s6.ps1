@@ -47,7 +47,7 @@ $xml = @'
 </Task>
 '@
 $xml = $xml -replace 'SUPERSTART', $StartAt
-$xml = $xml -replace 'RUNNERHOST', $RunnerHost
+$xml = $xml -creplace 'RUNNERHOST', $RunnerHost
 $xml | Out-File -Encoding unicode D:\fpv\ops\fpvs6loop.xml
 schtasks /delete /tn FPVS6Loop /f 2>$null | Out-Null
 schtasks /create /tn FPVS6Loop /xml D:\fpv\ops\fpvs6loop.xml /f
