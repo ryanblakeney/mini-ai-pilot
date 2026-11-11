@@ -1,3 +1,4 @@
+if (& 'D:\fpv\ops\fpv_busy_guard.ps1' -Self $PSCommandPath) { exit 0 }  # Claude Code 2026-11-11: shared busy guard (any other FPV* Running or any Blocks sim -> skip)
 # task_eval_follow.ps1 - S7 follow eval launch rig: starts Blocks, waits for the
 # AirSim port, runs rl_eval_follow.py, reports the eval_result.txt tail. Mirrors
 # the proven task_eval_v4.ps1 FPV_WAY branch semantics. Deliberately does NOT
@@ -51,7 +52,7 @@ try {
   try { $job | Wait-Process -Timeout 2400 -ErrorAction Stop } catch { }
   if (-not $job.HasExited) {
     LogW 'EVALFOLLOW_TIMEOUT_2400S_KILLING_PYTHON'
-    Stop-Process -Id $job.Id -Force -EA SilentlyContinue
+    & taskkill.exe /PID $job.Id /T /F 2>&1 | Out-Null
   }
   # success = python exited clean (or ExitCode unavailable in PS 5.1), stdout has no
   # EVAL_FAILED marker, AND eval_result.txt is FRESH (written after this run started).

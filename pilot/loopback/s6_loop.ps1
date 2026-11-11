@@ -2,6 +2,7 @@
 # Modeled on D:\fpv\rl\task_eval_v4.ps1 (FPV_WAY branch): collision guard ->
 # Blocks launch + port wait -> run bridge -> teardown Blocks -> result tail.
 param($RunnerHost, $RunnerPort = 9931)
+if (& 'D:\fpv\ops\fpv_busy_guard.ps1' -Self $PSCommandPath) { exit 0 }  # Claude Code 2026-11-11: shared busy guard (any other FPV* Running or any Blocks sim -> skip)
 $ErrorActionPreference = 'Continue'
 $ops = 'D:\fpv\ops'
 $out = "$ops\s6_loop_out.txt"
@@ -52,7 +53,7 @@ try {
   try { $job | Wait-Process -Timeout 2400 -ErrorAction Stop } catch { }
   if (-not $job.HasExited) {
     LogW 'BRIDGE_TIMEOUT_2400S_KILLING_PYTHON'
-    Stop-Process -Id $job.Id -Force -EA SilentlyContinue
+    & taskkill.exe /PID $job.Id /T /F 2>&1 | Out-Null
   }
   LogW "BRIDGE_EXITED"
 } finally {

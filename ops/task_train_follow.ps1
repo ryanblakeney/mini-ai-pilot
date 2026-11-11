@@ -1,3 +1,4 @@
+if (& 'D:\fpv\ops\fpv_busy_guard.ps1' -Self $PSCommandPath) { exit 0 }  # Claude Code 2026-11-11: shared busy guard (any other FPV* Running or any Blocks sim -> skip)
 # task_train_follow.ps1 - S7 follow_v1 SAC training rig (mirrors task_train_v4.ps1 semantics)
 $ErrorActionPreference = 'Continue'
 $ops = 'D:\fpv\ops'
@@ -113,7 +114,7 @@ try {
       break
     }
     Log "FOLLOWTRAIN_ATTEMPT_END attempt=$attempt exited=$($job.HasExited) code=$(if($job.HasExited){$job.ExitCode}else{'running'}) stall=$stall"
-    if (-not $job.HasExited) { Stop-Process -Id $job.Id -Force -EA SilentlyContinue }
+    if (-not $job.HasExited) { & taskkill.exe /PID $job.Id /T /F 2>&1 | Out-Null }
     Start-Sleep -Seconds 5
     # sim may be wedged too: recycle ONLY my own instance between attempts
     foreach ($mid in $mine) { Stop-Process -Id $mid -Force -EA SilentlyContinue }
