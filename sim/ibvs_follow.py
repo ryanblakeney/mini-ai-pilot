@@ -35,6 +35,14 @@ against the controller the owner actually ships:
 Anti-double-move discipline (Q3 gimbal lesson): exactly ONE integrated
 action per step -- the controller is stateless except hover-hold / give-up
 state.
+
+D16 Add-on: AvoidIBVSFollow (same module, composition -- IBVSFollow itself
+is UNTOUCHED) is the hand controller for the detour-required eval rung:
+IBVSFollow proposes the action, and a depth-grid veto (the agent's own
+obs[22:37] 3x5 grid, val=(d-1)/19, free=1.0) REPLACES the horizontal motion
+with a pure strafe toward the more open side whenever a forward-centre
+column sees an obstacle closer than veto_m. Velocity level ONLY -- no
+attitude/rate layer (app AvoidModifier-style). See the class docstring.
 """
 import os
 
@@ -128,3 +136,51 @@ class IBVSFollow:
         vn = float(np.clip(v_f * c - v_lat * s, -1.0, 1.0))
         ve = float(np.clip(v_f * s + v_lat * c, -1.0, 1.0))
         return np.array([vn, ve, v_d, yaw_a], dtype=np.float32)
+
+
+class AvoidIBVSFollow:
+    """IBVS + depth-grid forward veto (D16) -- velocity level ONLY.
+
+    Composition wrapper (IBVSFollow behavior/signatures UNCHANGED): the
+    inner app-aligned IBVS controller proposes the action; the agent's own
+    3x5 depth grid (obs[22:37], row-major, val=(d-1)/19 clipped, free=1.0)
+    vetoes it when any FORWARD-CENTRE column c in {1,2,3} sees an obstacle
+    closer than veto_m, i.e. col_min[c] < (veto_m - 1)/19 where col_min is
+    the min over the 3 rows. On veto, if the inner action has significant
+    horizontal motion, vn/ve are REPLACED by a lateral-only strafe of
+    magnitude min(0.6, ||horiz||) toward the more open outer column
+    (openness = col_min[0] vs col_min[4], higher = more open; v_lat + =
+    right = world (-sin yaw, cos yaw)). v_d and the yaw servo pass through
+    untouched -- pure velocity level, no attitude/rate layer. On a clear
+    corridor (or grid=None, or an inner hover/give-up with no horizontal
+    motion) the action passes through EXACTLY. reset() resets the inner.
+    """
+
+    def __init__(self, step_dt=0.5, veto_m=4.0):
+        self.inner = IBVSFollow(step_dt=step_dt)
+        self.veto_m = float(veto_m)
+
+    def reset(self):
+        self.inner.reset()
+
+    def action(self, box, est, range_valid, desired, drone_yaw=0.0,
+               grid=None):
+        """One 4-D action -- same args as IBVSFollow.action plus the 15-cell
+        depth grid (row-major 3x5) from obs[22:37]."""
+        a = self.inner.action(box, est, range_valid, desired,
+                              drone_yaw=drone_yaw)
+        if grid is None:
+            return a
+        g = np.asarray(grid, dtype=np.float64).reshape(3, 5)
+        col_min = g.min(axis=0)                    # min over the 3 rows
+        thr = (self.veto_m - 1.0) / 19.0           # val < thr  <=>  d < veto_m
+        if min(col_min[1], col_min[2], col_min[3]) >= thr:
+            return a                               # forward corridor clear
+        h = float(np.hypot(a[0], a[1]))
+        if h < 1e-6:
+            return a                # hover-on-loss / give-up: nothing to veto
+        # v_lat + = right = world (-sin yaw, cos yaw); side: open outer col
+        v_lat = float(min(0.6, h)) * (1.0 if col_min[4] > col_min[0] else -1.0)
+        return np.array([float(v_lat * -np.sin(drone_yaw)),
+                         float(v_lat * np.cos(drone_yaw)),
+                         a[2], a[3]], dtype=np.float32)

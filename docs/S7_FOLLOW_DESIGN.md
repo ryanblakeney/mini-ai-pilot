@@ -193,3 +193,42 @@ not a different one.
    eval metric must separate "left frame" from "lost forever": score per-visible-step.
 4. Depth grid from AABB cones may be near-useless in the sparse Blocks scene — if so,
    avoidance degrades to collision-terminal pressure only; document, don't fake it.
+
+## D15 Detour-required evaluation rung (FPV_DETOUR) — the owner-lane note 2026-11-10 20:46
+The eval grows a HARDER layout rung: the scripted target STARTS BEHIND a scene
+cube so a straight-line chase collides and a detour is required. Implementation
+is pure geometry over the ALREADY-ENUMERATED AABBs (the env's _grid_objs) —
+NO world mutation, no object spawning/moving (projectairsim move API stays
+unproven, D2 risk). follow_common.detour_blocker() picks the first box whose
+center is 3–10 m from the drone start and within ±60° of the start yaw;
+follow_common.detour_target() shifts the whole pre-integrated trajectory
+rigidly so the target start lies on the ray start→cube extended to
+cube_dist + U[3,6] m (ground z stays the script's; motion otherwise
+unchanged). Draw order stays comparable: the single detour rng draw happens
+in reset() AFTER the existing draws (desired → detector knobs → script →
+detour), so with FPV_DETOUR off (default 0) reset() is BIT-IDENTICAL to
+pre-D15. Honest fallback: no suitable cube => print FOLLOW_DETOUR=no_cube and
+run the episode unchanged; applied => FOLLOW_DETOUR=applied cube=<name> d=<m>.
+Same seeded rng, so all eval conditions (incl. D16 AVOID) see identical
+episodes when the knob is on.
+
+## D16 Avoid test hand-controller: AvoidIBVSFollow (velocity-level veto)
+The hand controller for the detour rung is IBVSFollow + a depth-grid forward
+veto (app AvoidModifier-style): composition wrapper AvoidIBVSFollow in
+ibvs_follow.py — IBVSFollow itself untouched. Per-column minima col_min[c]
+over the 3 rows of the agent's own obs[22:37] grid (val=(d-1)/19, free=1.0);
+if any forward-centre column c∈{1,2,3} has col_min[c] < (veto_m-1)/19
+(veto_m default 4 m) the forward motion is vetoed: the inner action's vn/ve
+are REPLACED by a lateral-only strafe of magnitude min(0.6, ‖horiz‖) toward
+the more open outer column (col_min[0] vs col_min[4]); v_d and the yaw servo
+pass through. Velocity level ONLY — no attitude/rate layer, one integrated
+action per step (Q3 discipline). On a clear corridor (or grid=None, or an
+inner hover/give-up) the inner action passes through EXACTLY. Eval condition
+ibvs_avoid (tag AVOID) runs this on the SAME obs/seeds in rl_eval_follow.py,
+baseline-only mode included, aggregated as ibvs_avoid_mean_center / loss /
+collisions; the FOLLOW_OK verdict logic is UNCHANGED.
+
+Deliberate choice: the follow_v1 TRAINING scenario stays UNCHANGED — the
+detour is an evaluation rung only; a follow_v2 candidate (detour in training
++ explicit d_min shaping) is on hold until the AVOID-vs-IBVS comparison
+actually shows a gap.

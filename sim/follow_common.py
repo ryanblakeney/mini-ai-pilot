@@ -436,6 +436,55 @@ def depth_grid(drone_pos, drone_yaw, objects, params=None,
 
 
 # ---------------------------------------------------------------------------
+# detour-required eval layout (D15) -- PURE, used by follow_env FPV_DETOUR
+# ---------------------------------------------------------------------------
+
+def detour_blocker(boxes, start, yaw, lo=3.0, hi=10.0, cone_deg=60.0):
+    """Pick the 'detour-required' blocker among the enumerated scene AABBs
+    (D15). boxes: iterable of (name, center(3,), half) -- the env's
+    _grid_objs, NO world mutation (pure selection over geometry). Returns
+    (name, center) of the FIRST box whose center is
+      * lo..hi metres (3-D) from the drone's start position, AND
+      * within +-cone_deg degrees of the drone's start yaw,
+    else None. Deterministic: first match in enumeration order -- NO rng
+    draw here; the caller controls rng consumption via detour_target().
+    """
+    s = np.asarray(start, dtype=np.float64)
+    for name, center, _half in boxes:
+        c = np.asarray(center, dtype=np.float64)
+        d = float(np.linalg.norm(c - s))
+        if not (lo <= d <= hi):
+            continue
+        bearing = math.atan2(float(c[1] - s[1]), float(c[0] - s[0]))
+        diff = (bearing - float(yaw) + math.pi) % (2.0 * math.pi) - math.pi
+        if abs(math.degrees(diff)) <= cone_deg:
+            return str(name), c
+    return None
+
+
+def detour_target(script, center, drone_start, rng, extra_lo=3.0,
+                  extra_hi=6.0):
+    """Override the scripted target's START so it lies BEHIND the blocker
+    (D15): on the ray drone_start -> center, extended past the centre to
+    cube_dist + U[extra_lo, extra_hi] metres; ground z stays the script's.
+    The whole pre-integrated trajectory is shifted RIGIDLY (script['xy'] is
+    replaced by xy + delta) so the script's motion is otherwise UNCHANGED.
+    rng draws EXACTLY ONE uniform (the extension) and the caller runs this
+    AFTER the existing reset() draws (desired -> detector knobs -> script),
+    so with FPV_DETOUR off (never called) same-seed streams are untouched.
+    Returns the start->target-start ray distance (m) for logging.
+    """
+    s = np.asarray(drone_start, dtype=np.float64)
+    c = np.asarray(center, dtype=np.float64)
+    d = max(float(np.linalg.norm(c - s)), 1e-6)
+    ray = d + float(rng.uniform(extra_lo, extra_hi))
+    p = s + (c - s) / d * ray                 # ground z comes from the script
+    xy = script["xy"]
+    script["xy"] = xy + (p[:2] - xy[0])
+    return float(ray)
+
+
+# ---------------------------------------------------------------------------
 # reward v6 (D7 + D11) -- PURE, dominance-proven by check_follow_reward.py
 # ---------------------------------------------------------------------------
 

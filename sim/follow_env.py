@@ -47,8 +47,10 @@ FPV_YAW (0 -> 3-D action, logged fallback), FPV_DR (1 = per-episode
 domain randomization), FPV_GROUND_Z (default -2.7, Blocks scene ground),
 FPV_COLL_ROUTE (auto|geometry), FPV_RANGE_MIN / FPV_RANGE_MAX (D11 desired
 sweep bounds, default 1.5 / 15.0 m), FPV_DIST_STAR set => FIXED desired
-every episode (back-compat), FPV_RANGE_NOISE / FPV_RANGE_EMA (D12), plus the
-parent's FPV_DISTURB_* / FPV_PORT_*.
+every episode (back-compat), FPV_RANGE_NOISE / FPV_RANGE_EMA (D12),
+FPV_DETOUR (D15: 1 = evaluation rung -- start the scripted target behind a
+cube dead ahead; off by default, reset() stream bit-identical when off),
+plus the parent's FPV_DISTURB_* / FPV_PORT_*.
 
 Coordinates: AirSim NED. Run ONLY where Blocks.exe is listening
 (scheduled-task console-session pattern). py_compile-only on non-Windows.
@@ -84,6 +86,8 @@ class FollowDroneEnv(BlocksDroneEnv):
         kind = os.environ.get("FPV_TARGET_KIND", "rand").strip().lower()
         self._kind = fc.KIND_ALIAS.get(kind, "rand")
         self._dr = os.environ.get("FPV_DR", "0").strip() == "1"
+        # D15: detour-required eval rung (default OFF => reset() bit-identical)
+        self._detour = os.environ.get("FPV_DETOUR", "0").strip() == "1"
         self._p_miss = float(os.environ.get("FPV_PMISS", "0.15"))
         self._jit = float(os.environ.get("FPV_JIT", "0.005"))
         lat = os.environ.get("FPV_LAT_MS", "").strip()
@@ -259,6 +263,21 @@ class FollowDroneEnv(BlocksDroneEnv):
             src = self._lp.sync(self._enumerate_boxes(), timeout=120)
         self._grid_objs = [(n, c, np.array([h, h, h], dtype=np.float32))
                            for (n, c, h) in src]
+        # D15 (FPV_DETOUR=1, default off): detour-required eval rung --
+        # AFTER the script draw (fixed order desired -> detector knobs ->
+        # script -> detour) so same-seed streams are untouched when off.
+        # Pure geometry over the enumerated AABBs (NO world mutation): pick
+        # one cube 3-10 m dead ahead (+-60 deg of start yaw) and shift the
+        # target start behind it; honest no_cube fallback runs unchanged.
+        if self._detour:
+            blk = fc.detour_blocker(self._grid_objs, pos0, yaw0)
+            if blk is None:
+                print("FOLLOW_DETOUR=no_cube", flush=True)
+            else:
+                d_ray = fc.detour_target(self._script, blk[1], pos0,
+                                         self._rng)
+                print(f"FOLLOW_DETOUR=applied cube={blk[0]} d={d_ray:.1f}",
+                      flush=True)
         obs = self._obs37(self._obs_from_kin(k0)[0], k0)
         return obs, {"dist": 0.0, "in_view": False, "center_err": 0.0,
                      "loss_steps": 0, "target_kind": self._script["kind"],
@@ -286,7 +305,7 @@ class FollowDroneEnv(BlocksDroneEnv):
                 self._lp.sync(self._apply_yaw_async(float(action[3]) * 0.5),
                               timeout=20)
             except Exception as exc:    # D3 risk item: untested rotate API
-                print(f"FPV_YAW_FALLBACK rotate_by_velocity_async failed "
+                print(f"FPV_YAW_FALLBACK rotate_by_yaw_rate_async failed "
                       f"({exc!r}); yaw dim ignored this episode", flush=True)
                 self._yaw_on = False
         # parent raw hover-error obs (err=pos-target, vel, rpy, ang, prev a3)

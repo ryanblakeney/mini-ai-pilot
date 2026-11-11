@@ -13,6 +13,8 @@ conditions:
   policy   deterministic predict from FPV_POLICY (SAC.load, PPO fallback)
   zero     all-zero action baseline
   ibvs     ibvs_follow.IBVSFollow fed from the SAME obs box features
+  ibvs_avoid  ibvs_follow.AvoidIBVSFollow (D16: IBVS + depth-grid forward
+            veto) fed the SAME obs: box feats + obs[22:37] grid + obs[8] yaw
 Verdict is baked in:
   FOLLOW_OK iff policy_mean_center < ibvs_mean_center
           AND policy_mean_center < zero_mean_center
@@ -21,7 +23,8 @@ Verdict is baked in:
 Per-visible-step reporting per spec risk 3: loss (frag) time is a first-class
 column, not folded into center err. os._exit at end (Win teardown segfault).
 Baseline-only mode: if no policy file exists at FPV_POLICY, the stable_baselines3
-import and model load are skipped, only zero + ibvs run, verdict=BASELINE_RECORDED.
+import and model load are skipped, only zero + ibvs + ibvs_avoid run,
+verdict=BASELINE_RECORDED.
 """
 import csv
 import os
@@ -54,7 +57,7 @@ try:
     import numpy as np
 
     from follow_env import FollowDroneEnv
-    from ibvs_follow import IBVSFollow
+    from ibvs_follow import AvoidIBVSFollow, IBVSFollow
 
     env = FollowDroneEnv(step_dt=0.5, max_steps=MAX_STEPS_EVAL)
     n_act = int(env.action_space.shape[0])
@@ -71,7 +74,8 @@ try:
         log(f"POLICY={POLICY} ALGO={algo} COLL_ROUTE="
             f"{getattr(env, 'collision_route', '?')} YAW_DIMS={n_act}")
     else:
-        log(f"BASELINE_ONLY no policy at {POLICY} - measuring zero + ibvs")
+        log(f"BASELINE_ONLY no policy at {POLICY} - measuring zero + ibvs "
+            f"+ ibvs_avoid")
 
     def run_episode(acting, seed, e=None):
         """One episode; list of (center_err, dist, in_view, loss, collided)."""
@@ -94,8 +98,9 @@ try:
         return np.zeros(n_act, dtype=np.float32)
 
     ibvs = IBVSFollow()
+    avoid = AvoidIBVSFollow()
 
-    def ibvs_act(obs):
+    def ibvs_inputs(obs):
         # box features from the SAME obs the policy sees (D13 obs v2 layout):
         # [15]cx_err [16]cy_err [17]clip(log(est/desired)) [18]desired/15
         # [19]range_valid [20]conf [21]age/10, yaw=obs[8]. Reconstruct the
@@ -111,7 +116,18 @@ try:
             "cy": env._cam["cy0"] + cy_err * env._cam["cy0"],
             "age": age10 * 10.0}
         est = desired * float(np.exp(log_r))
+        return box, est, valid, desired
+
+    def ibvs_act(obs):
+        box, est, valid, desired = ibvs_inputs(obs)
         a = ibvs.action(box, est, valid, desired, drone_yaw=float(obs[8]))
+        return a[:n_act]
+
+    def avoid_act(obs):
+        # D16: same obs stream + the agent's own depth grid obs[22:37]
+        box, est, valid, desired = ibvs_inputs(obs)
+        a = avoid.action(box, est, valid, desired, drone_yaw=float(obs[8]),
+                         grid=obs[22:37])
         return a[:n_act]
 
     rows = []
@@ -139,6 +155,7 @@ try:
 
     zero_rows = run_tagged("zero_ep", zero_act, "ZERO")
     ibvs_rows = run_tagged("ibvs_ep", ibvs_act, "IBVS", reset=ibvs.reset)
+    avoid_rows = run_tagged("avoid_ep", avoid_act, "AVOID", reset=avoid.reset)
     pol_rows = [] if baseline_only else run_tagged("policy_ep", policy_act, "EP")
 
     env.close()
@@ -149,15 +166,18 @@ try:
                 int(sum(bool(r[6]) for r in rs)))
 
     ibv_c, ibv_loss, ibv_coll = agg(ibvs_rows)
+    av_c, av_loss, av_coll = agg(avoid_rows)
     zer_c, zer_loss, zer_coll = agg(zero_rows)
     pol_c = pol_loss = pol_coll = None  # unused in baseline-only mode
     if baseline_only:
         verdict = "BASELINE_RECORDED"
         log(f"POLICY_MEAN_CENTER=NA IBVS_MEAN_CENTER={ibv_c:.3f} "
+            f"AVOID_MEAN_CENTER={av_c:.3f} "
             f"ZERO_MEAN_CENTER={zer_c:.3f} POLICY_LOSS=NA "
-            f"IBVS_LOSS={ibv_loss} ZERO_LOSS={zer_loss} "
+            f"IBVS_LOSS={ibv_loss} AVOID_LOSS={av_loss} ZERO_LOSS={zer_loss} "
             f"COLLISIONS=NA "
             f"IBVS_COLLISIONS={ibv_coll}/{N_EPISODES} "
+            f"AVOID_COLLISIONS={av_coll}/{N_EPISODES} "
             f"ZERO_COLLISIONS={zer_coll}/{N_EPISODES} VERDICT={verdict}")
     else:
         pol_c, pol_loss, pol_coll = agg(pol_rows)
@@ -165,31 +185,39 @@ try:
               and pol_loss <= ibv_loss)
         verdict = "FOLLOW_OK" if ok else "FOLLOW_NOT_LEARNED"
         log(f"POLICY_MEAN_CENTER={pol_c:.3f} IBVS_MEAN_CENTER={ibv_c:.3f} "
+            f"AVOID_MEAN_CENTER={av_c:.3f} "
             f"ZERO_MEAN_CENTER={zer_c:.3f} POLICY_LOSS={pol_loss} "
-            f"IBVS_LOSS={ibv_loss} ZERO_LOSS={zer_loss} "
+            f"IBVS_LOSS={ibv_loss} AVOID_LOSS={av_loss} ZERO_LOSS={zer_loss} "
             f"COLLISIONS={pol_coll}/{N_EPISODES} "
             f"IBVS_COLLISIONS={ibv_coll}/{N_EPISODES} "
+            f"AVOID_COLLISIONS={av_coll}/{N_EPISODES} "
             f"ZERO_COLLISIONS={zer_coll}/{N_EPISODES} VERDICT={verdict}")
 
     with open(os.path.join(RUN_DIR, "eval_result.txt"), "w") as f:
         if baseline_only:
             f.write(f"verdict={verdict}\n"
                     f"ibvs_mean_center={ibv_c:.4f}\n"
+                    f"ibvs_avoid_mean_center={av_c:.4f}\n"
                     f"zero_mean_center={zer_c:.4f}\n"
                     f"ibvs_loss_steps={ibv_loss}\n"
+                    f"ibvs_avoid_loss_steps={av_loss}\n"
                     f"zero_loss_steps={zer_loss}\n"
                     f"ibvs_collisions={ibv_coll}\n"
+                    f"ibvs_avoid_collisions={av_coll}\n"
                     f"zero_collisions={zer_coll}\n")
         else:
             f.write(f"verdict={verdict}\n"
                     f"policy_mean_center={pol_c:.4f}\n"
                     f"ibvs_mean_center={ibv_c:.4f}\n"
+                    f"ibvs_avoid_mean_center={av_c:.4f}\n"
                     f"zero_mean_center={zer_c:.4f}\n"
                     f"policy_loss_steps={pol_loss}\n"
                     f"ibvs_loss_steps={ibv_loss}\n"
+                    f"ibvs_avoid_loss_steps={av_loss}\n"
                     f"zero_loss_steps={zer_loss}\n"
                     f"policy_collisions={pol_coll}\n"
                     f"ibvs_collisions={ibv_coll}\n"
+                    f"ibvs_avoid_collisions={av_coll}\n"
                     f"zero_collisions={zer_coll}\n")
         for r in rows:
             f.write(",".join(str(x) for x in r) + "\n")
