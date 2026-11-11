@@ -185,17 +185,12 @@ class FollowDroneEnv(BlocksDroneEnv):
         return boxes
 
     async def _apply_yaw_async(self, yaw_rate):
-        # D3: rotate-by-velocity async API -- UNTESTED on this rig; smoke
-        # verifies. TypeError fallback kept for signature drift in the client.
-        try:
-            await asyncio.wait_for(
-                self.drone.rotate_by_velocity_async(
-                    0.0, 0.0, float(yaw_rate), duration=self.step_dt),
-                timeout=15)
-        except TypeError:
-            await asyncio.wait_for(
-                self.drone.rotate_by_velocity_async(z_rate=float(yaw_rate)),
-                timeout=15)
+        # D3: rotate_by_yaw_rate_async(yaw_rate, duration) -- verified present
+        # on the rig 2026-11-10 (RotateByYawRate RPC).
+        await asyncio.wait_for(
+            self.drone.rotate_by_yaw_rate_async(float(yaw_rate),
+                                                self.step_dt),
+            timeout=15)
 
     def _geom_hit(self, pos):
         for _name, center, half in self._boxes:
