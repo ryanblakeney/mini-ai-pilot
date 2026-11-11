@@ -47,7 +47,7 @@ try {
   }
   LogW "PORT_8989_UP after $([math]::Round(((Get-Date) - $t0).TotalSeconds, 1))s"
   $bridgeArgs = @('D:\fpv\ops\loopback_bridge.py', '--runner-host', "$RunnerHost", '--runner-port', "$RunnerPort")
-  $job = Start-Process -FilePath 'D:\fpv\venv312\Scripts\python.exe' -ArgumentList $bridgeArgs -WorkingDirectory 'D:\fpv\ops' -PassThru -NoNewWindow -RedirectStandardOutput "$ops\s6_py_stdout.txt" -RedirectStandardError "$ops\s6_py_stderr.txt"
+  $job = Start-Process -FilePath 'D:\fpv\venv312\Scripts\python.exe' -ArgumentList $bridgeArgs -WorkingDirectory 'D:\fpv\ProjectAirSim\client\python\example_user_scripts' -PassThru -NoNewWindow -RedirectStandardOutput "$ops\s6_py_stdout.txt" -RedirectStandardError "$ops\s6_py_stderr.txt"
   LogW "BRIDGE_STARTED pid=$($job.Id)"
   try { $job | Wait-Process -Timeout 2400 -ErrorAction Stop } catch { }
   if (-not $job.HasExited) {
