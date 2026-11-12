@@ -4,7 +4,7 @@ expert mean action, concept accuracy, zero-ablation causal alignment
 formulation), the "correlated-not-causal" exhibit and the money table.
 
 Centerpiece paper: Rountree, Verma, So, Fan, Shah. "Causal Concept Explanations
-for Deep Neural Models." NeurIPS 2026. arXiv 2603.21369.
+for Deep Neural Models." NeurIPS 2026. arXiv 2611.14407.
 
 Estimator deviation (pre-declared): the A/B match estimator needs mutually
 exclusive concept groups which our ontology lacks, so we use the paper's own

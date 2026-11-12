@@ -3,7 +3,7 @@
 (same arch, same warmup, same total epochs, alignment losses identically zero).
 
 Centerpiece paper: Rountree, Verma, So, Fan, Shah. "Causal Concept Explanations
-for Deep Neural Models." NeurIPS 2026. arXiv 2603.21369.
+for Deep Neural Models." NeurIPS 2026. arXiv 2611.14407.
 
 Continuous adaptation vs the StS harness: Yt is the expert SAC mean action
 A (N,3) float32 (NO one-hot); L_task stays F.mse_loss(yh, yb); the concept

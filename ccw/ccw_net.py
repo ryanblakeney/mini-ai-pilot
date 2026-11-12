@@ -3,7 +3,7 @@ alignment losses (Algorithm 1 pieces), zero-ablation attribution and Prop-1
 self-checks.
 
 Centerpiece paper: Rountree, Verma, So, Fan, Shah. "Causal Concept Explanations
-for Deep Neural Models." NeurIPS 2026. arXiv 2603.21369.
+for Deep Neural Models." NeurIPS 2026. arXiv 2611.14407.
 
 Follows the paper's aircraft main-table config (Apps C.1, E): D=16 concept
 slots, single-head bias-free attention wrapper; mediator = conditional affine
