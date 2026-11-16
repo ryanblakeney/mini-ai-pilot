@@ -2,3 +2,23 @@ __pycache__/
 *.env
 *.key
 .venv/
+
+# build caches (never commit)
+.gradle/
+build/
+local.properties
+# secrets (DJI app key etc.)
+app_key.env
+# model weights / datasets: download or keep local. Only small policies we trained in the SIM may be committed (pilot/export/).
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.npz
+# private footage, reconstructions, flight logs (home/yard/location)
+*.mp4
+*.mov
+footage/
+colmap/
+flights/
+*_PRIVATE*

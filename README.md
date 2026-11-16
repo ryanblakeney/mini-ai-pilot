@@ -22,4 +22,4 @@ Flight commands (virtual stick) on the real aircraft, live video decoding, on-ph
 Never fly near people, roads or restricted airspace; check local rules; remove propellers for every bench test. The code here sends no flight commands. Use at your own risk. The DUML protocol notes come from community reverse engineering and may be wrong or change with firmware.
 
 ## License
-Apache-2.0 (see LICENSE). Third-party projects keep their own licenses.
+AGPL-3.0 (see LICENSE) - changed from Apache-2.0 on 2026-11-16 so the project can use GPL/AGPL components. Third-party projects keep their own licenses; see THIRD_PARTY.md. Model weights and private data are not stored here.
